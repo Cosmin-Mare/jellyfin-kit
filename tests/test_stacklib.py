@@ -593,6 +593,315 @@ class StacklibTests(unittest.TestCase):
             self.assertIn("External", text)
             self.assertIn("DisabledForLocalAddresses", text)
 
+    def _cleared_settings_env(self):
+        keys = [item.name.upper() for item in fields(stacklib.Settings)]
+        saved = {key: os.environ.pop(key) for key in keys if key in os.environ}
+        self.addCleanup(lambda: os.environ.update(saved))
+
+    def test_cloudflare_without_token_explains_the_next_command(self):
+        self._cleared_settings_env()
+        with TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(stacklib, "ENV_PATH", Path(tmp) / ".env"):
+                settings, _extras = stacklib.collect_settings(assume_yes=True, no_vpn=True, remote="cloudflare")
+                with self.assertRaises(stacklib.SetupError) as raised:
+                    stacklib.require_cloudflare_credentials(settings)
+        text = str(raised.exception)
+        self.assertIn("api-tokens", text)
+        self.assertIn("CLOUDFLARE_API_TOKEN", text)
+        self.assertIn("Cloudflare Tunnel", text)
+        self.assertIn("--remote forward", text)
+        self.assertIn("--remote tailscale", text)
+        self.assertIn("--no-vpn", text)
+
+    def test_unknown_remote_mode_lists_the_three_choices(self):
+        self._cleared_settings_env()
+        with TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(stacklib, "ENV_PATH", Path(tmp) / ".env"):
+                with self.assertRaises(stacklib.SetupError) as raised:
+                    stacklib.collect_settings(assume_yes=True, no_vpn=True, remote="magic")
+        self.assertIn("--remote cloudflare", str(raised.exception))
+        self.assertIn("--remote forward", str(raised.exception))
+
+    def test_hostname_accepts_a_pasted_url(self):
+        self._cleared_settings_env()
+        os.environ["CLOUDFLARE_API_TOKEN"] = "token"
+        os.environ["CLOUDFLARE_HOSTNAME"] = "https://Watch.Example.com/play"
+        self.addCleanup(lambda: os.environ.pop("CLOUDFLARE_API_TOKEN", None))
+        self.addCleanup(lambda: os.environ.pop("CLOUDFLARE_HOSTNAME", None))
+        with TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(stacklib, "ENV_PATH", Path(tmp) / ".env"):
+                settings, _extras = stacklib.collect_settings(assume_yes=True, no_vpn=True, remote="cloudflare")
+        self.assertEqual(settings.cloudflare_hostname, "watch.example.com")
+        stacklib.require_cloudflare_credentials(settings)
+
+    def test_compose_adds_cloudflared_only_for_a_tunnel(self):
+        plain = stacklib.render_compose(False)
+        tunneled = stacklib.render_compose(True, cloudflare=True)
+        self.assertNotIn("cloudflared", plain)
+        self.assertIn("cloudflare/cloudflared:latest", tunneled)
+        self.assertIn("TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}", tunneled)
+        self.assertIn("container_name: cloudflared", tunneled)
+
+    def test_credentials_list_public_urls_and_keep_downloads_local(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "credentials.txt"
+            with unittest.mock.patch.object(stacklib, "CREDENTIALS_PATH", path):
+                settings = stacklib.Settings(
+                    admin_user="admin",
+                    admin_password="secret",
+                    use_vpn="0",
+                    public_jellyfin_url="https://watch.example.com",
+                    public_seerr_url="https://requests.example.com",
+                )
+                stacklib.write_credentials(settings, {}, "Cloudflare Tunnel is attached.")
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("https://watch.example.com", text)
+            self.assertIn("https://requests.example.com", text)
+            self.assertIn("stay on this computer", text)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_cloudflare_error_tells_you_which_permission_to_add(self):
+        message = stacklib.cloudflare_error_message(
+            403,
+            {"errors": [{"message": "Authentication error"}]},
+            "POST /accounts/x/cfd_tunnel",
+        )
+        self.assertIn("Cloudflare Tunnel", message)
+        self.assertIn("DNS", message)
+        self.assertIn("api-tokens", message)
+
+    def test_missing_zone_names_the_hostname_and_the_dashboard(self):
+        message = stacklib.zone_missing_message("watch.example.com")
+        self.assertIn("watch.example.com", message)
+        self.assertIn("dash.cloudflare.com", message)
+        self.assertIn("nameservers", message)
+
+    def test_provision_cloudflare_creates_tunnel_dns_and_is_safe_to_repeat(self):
+        settings = stacklib.Settings(
+            remote_access="cloudflare",
+            cloudflare_api_token="token",
+            cloudflare_hostname="watch.example.com",
+            use_vpn="0",
+        )
+        fake = FakeCloudflare()
+        note = stacklib.provision_cloudflare(settings, call=fake)
+        stacklib.provision_cloudflare(settings, call=fake)
+        posts = [call for call in fake.calls if call[0] == "POST" and call[1].endswith("/cfd_tunnel")]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(settings.cloudflare_tunnel_token, "connector-token")
+        self.assertEqual(settings.public_jellyfin_url, "https://watch.example.com")
+        self.assertEqual(settings.public_seerr_url, "https://requests.example.com")
+        self.assertIn("http://jellyfin:8096", json.dumps(fake.config))
+        self.assertIn("http://seerr:5055", json.dumps(fake.config))
+        self.assertIn("http_status:404", json.dumps(fake.config))
+        names = {record["name"] for record in fake.records}
+        self.assertEqual(names, {"watch.example.com", "requests.example.com"})
+        self.assertTrue(all(record["content"] == "tun-1.cfargotunnel.com" for record in fake.records))
+        self.assertIn("--remote forward", note)
+
+    def test_provision_refuses_to_replace_a_different_dns_record(self):
+        settings = stacklib.Settings(
+            remote_access="cloudflare",
+            cloudflare_api_token="token",
+            cloudflare_hostname="watch.example.com",
+            cloudflare_seerr_hostname="off",
+        )
+        fake = FakeCloudflare()
+        fake.records.append({"id": "rec-a", "type": "A", "name": "watch.example.com", "content": "192.0.2.9"})
+        with self.assertRaises(stacklib.SetupError) as raised:
+            stacklib.provision_cloudflare(settings, call=fake)
+        self.assertIn("watch.example.com", str(raised.exception))
+        self.assertIn("DNS", str(raised.exception))
+        self.assertEqual(settings.cloudflare_tunnel_id, "tun-1")
+
+    def test_missing_zone_stops_with_the_domain_instructions(self):
+        settings = stacklib.Settings(
+            cloudflare_api_token="token",
+            cloudflare_hostname="watch.example.com",
+        )
+        fake = FakeCloudflare(zones={})
+        with self.assertRaises(stacklib.SetupError) as raised:
+            stacklib.provision_cloudflare(settings, call=fake)
+        self.assertIn("watch.example.com", str(raised.exception))
+        self.assertIn("Active", str(raised.exception))
+
+    def test_several_cloudflare_accounts_ask_for_an_id(self):
+        settings = stacklib.Settings(cloudflare_api_token="token", cloudflare_hostname="watch.example.com")
+        fake = FakeCloudflare(accounts=[{"id": "a", "name": "Home"}, {"id": "b", "name": "Work"}])
+        with self.assertRaises(stacklib.SetupError) as raised:
+            stacklib.provision_cloudflare(settings, call=fake)
+        text = str(raised.exception)
+        self.assertIn("CLOUDFLARE_ACCOUNT_ID", text)
+        self.assertIn("Home", text)
+        self.assertIn("Work", text)
+
+    def test_upnp_control_url_is_read_from_the_router_description(self):
+        xml = """
+        <root xmlns="urn:schemas-upnp-org:device-1-0">
+          <device><serviceList><service>
+            <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+            <controlURL>/ctl/IPConn</controlURL>
+          </service></serviceList></device>
+        </root>
+        """
+        control, service = stacklib.parse_upnp_service(xml, "http://192.168.1.1:49000/rootDesc.xml")
+        self.assertEqual(control, "http://192.168.1.1:49000/ctl/IPConn")
+        self.assertIn("WANIPConnection", service)
+
+    def test_port_forward_success_publishes_the_router_address(self):
+        settings = stacklib.Settings(use_vpn="0", remote_access="forward")
+        seen = []
+
+        def discover():
+            return "http://192.168.1.1:49000/rootDesc.xml"
+
+        def exchange(url, data=None, headers=None):
+            if data is None:
+                return 200, """
+                <root><device><serviceList><service>
+                  <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+                  <controlURL>/ctl/IPConn</controlURL>
+                </service></serviceList></device></root>
+                """
+            seen.append(data)
+            if b"GetExternalIPAddress" in data:
+                return 200, "<root><NewExternalIPAddress>203.0.113.8</NewExternalIPAddress></root>"
+            return 200, ""
+
+        note = stacklib.forward_ports(
+            settings,
+            discover=discover,
+            exchange=exchange,
+            local_ip="192.168.1.20",
+        )
+        self.assertEqual(settings.public_jellyfin_url, "http://203.0.113.8:8096")
+        self.assertEqual(settings.public_seerr_url, "http://203.0.113.8:5055")
+        mapped = b"".join(seen)
+        self.assertIn(b"192.168.1.20", mapped)
+        self.assertIn(b"8096", mapped)
+        self.assertIn(b"5055", mapped)
+        self.assertIn("phone", note)
+
+    def test_port_forward_without_upnp_prints_the_manual_steps(self):
+        settings = stacklib.Settings(use_vpn="0", remote_access="forward", jellyfin_port="8096", seerr_port="5055")
+        note = stacklib.forward_ports(
+            settings,
+            discover=lambda: None,
+            exchange=lambda *args, **kwargs: (500, ""),
+            local_ip="192.168.1.20",
+            lookup_public_ip=lambda: "203.0.113.9",
+        )
+        self.assertIn("192.168.1.20", note)
+        self.assertIn("8096", note)
+        self.assertIn("5055", note)
+        self.assertIn("http://203.0.113.9:8096", note)
+        self.assertIn("ufw allow", note)
+        self.assertIn("stay on this computer", note)
+        self.assertEqual(settings.public_jellyfin_url, "")
+
+    def test_carrier_nat_sends_you_to_the_tunnel(self):
+        settings = stacklib.Settings(use_vpn="0", remote_access="forward")
+
+        def exchange(url, data=None, headers=None):
+            if data is None:
+                return 200, """
+                <root><device><serviceList><service>
+                  <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+                  <controlURL>/ctl/IPConn</controlURL>
+                </service></serviceList></device></root>
+                """
+            if b"GetExternalIPAddress" in data:
+                return 200, "<root><NewExternalIPAddress>100.64.1.5</NewExternalIPAddress></root>"
+            return 200, ""
+
+        note = stacklib.forward_ports(
+            settings,
+            discover=lambda: "http://192.168.1.1/desc.xml",
+            exchange=exchange,
+            local_ip="192.168.1.20",
+        )
+        self.assertIn("--remote tailscale", note)
+        self.assertNotIn("domain on Cloudflare", note)
+        self.assertEqual(settings.public_jellyfin_url, "")
+
+    def test_tailscale_running_publishes_its_address(self):
+        settings = stacklib.Settings(use_vpn="0", remote_access="tailscale")
+        note = stacklib.describe_tailscale(
+            settings,
+            {
+                "BackendState": "Running",
+                "Self": {
+                    "DNSName": "lounge.tailnet.ts.net.",
+                    "TailscaleIPs": ["100.90.1.2", "fd7a:115c:a1e0::1"],
+                },
+            },
+        )
+        self.assertEqual(settings.public_jellyfin_url, "http://100.90.1.2:8096")
+        self.assertEqual(settings.public_seerr_url, "http://100.90.1.2:5055")
+        self.assertIn("lounge.tailnet.ts.net", note)
+        self.assertIn("same account", note)
+
+    def test_tailscale_login_prints_the_sign_in_link(self):
+        settings = stacklib.Settings(use_vpn="0", remote_access="tailscale")
+        note = stacklib.describe_tailscale(
+            settings,
+            {"BackendState": "NeedsLogin", "AuthURL": "https://login.tailscale.com/a/abc123"},
+        )
+        self.assertIn("https://login.tailscale.com/a/abc123", note)
+        self.assertIn("--remote tailscale", note)
+        self.assertEqual(settings.public_jellyfin_url, "")
+
+    def test_tailscale_missing_prints_the_install_step(self):
+        settings = stacklib.Settings(use_vpn="0", remote_access="tailscale")
+        note = stacklib.describe_tailscale(settings, None, installed=False)
+        self.assertIn("tailscale.com/download", note)
+        self.assertIn("sudo tailscale up", note)
+        self.assertEqual(settings.public_jellyfin_url, "")
+
+    def test_private_and_public_addresses(self):
+        self.assertFalse(stacklib.is_public_ip("192.168.1.4"))
+        self.assertFalse(stacklib.is_public_ip("10.1.1.1"))
+        self.assertFalse(stacklib.is_public_ip("100.64.0.8"))
+        self.assertTrue(stacklib.is_public_ip("203.0.113.8"))
+
+
+class FakeCloudflare:
+    def __init__(self, accounts=None, zones=None):
+        self.accounts = accounts if accounts is not None else [{"id": "acct", "name": "Home"}]
+        self.zones = {"example.com": [{"id": "zone1", "name": "example.com"}]} if zones is None else zones
+        self.calls = []
+        self.tunnels = []
+        self.records = []
+        self.config = None
+
+    def __call__(self, method, path, body=None):
+        self.calls.append((method, path, body))
+        parsed = urllib.parse.urlsplit(path)
+        query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/accounts":
+            return self.accounts
+        if parsed.path == "/zones":
+            return self.zones.get(query.get("name", [""])[0], [])
+        if parsed.path == "/accounts/acct/cfd_tunnel" and method == "GET":
+            return list(self.tunnels)
+        if parsed.path == "/accounts/acct/cfd_tunnel" and method == "POST":
+            tunnel = {"id": "tun-1", "name": body["name"], "token": "connector-token"}
+            self.tunnels.append({"id": "tun-1", "name": body["name"]})
+            return tunnel
+        if parsed.path.endswith("/token"):
+            return "connector-token"
+        if parsed.path.endswith("/configurations"):
+            self.config = body
+            return {}
+        if parsed.path == "/zones/zone1/dns_records" and method == "GET":
+            name = query.get("name", [""])[0]
+            return [item for item in self.records if item["name"] == name]
+        if parsed.path == "/zones/zone1/dns_records" and method == "POST":
+            item = dict(body, id=f"rec-{len(self.records) + 1}")
+            self.records.append(item)
+            return item
+        raise AssertionError((method, path))
+
 
 if __name__ == "__main__":
     unittest.main()

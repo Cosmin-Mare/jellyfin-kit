@@ -16,8 +16,10 @@ import json
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -69,6 +71,15 @@ class Settings:
     openvpn_password: str = ""
     wireguard_private_key: str = ""
     wireguard_addresses: str = ""
+    remote_access: str = "local"
+    cloudflare_api_token: str = ""
+    cloudflare_hostname: str = ""
+    cloudflare_seerr_hostname: str = ""
+    cloudflare_account_id: str = ""
+    cloudflare_tunnel_id: str = ""
+    cloudflare_tunnel_token: str = ""
+    public_jellyfin_url: str = ""
+    public_seerr_url: str = ""
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, str]) -> "Settings":
@@ -204,7 +215,7 @@ def confirm(label: str, default: bool = True, assume_yes: bool = False) -> bool:
     return typed in {"y", "yes"}
 
 
-def render_compose(use_vpn: bool, gluetun_env: Iterable[str] = ()) -> str:
+def render_compose(use_vpn: bool, gluetun_env: Iterable[str] = (), cloudflare: bool = False) -> str:
     """Compose file for the guide's stack, plus Seerr for requests."""
     reserved = {
         "PUID",
@@ -346,7 +357,7 @@ def render_compose(use_vpn: bool, gluetun_env: Iterable[str] = ()) -> str:
         download_services = download_services.replace("{extra_block}", extra_block)
     else:
         download_services = download_services.replace("\n{extra_block}", "")
-    return f"""name: jellyfin
+    rendered = f"""name: jellyfin
 
 services:
   jellyfin:
@@ -410,6 +421,20 @@ services:
       - radarr
     restart: unless-stopped
 """
+    if cloudflare:
+        rendered += """
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - jellyfin
+      - seerr
+    restart: unless-stopped
+"""
+    return rendered
 
 
 def write_qbittorrent_conf(config_dir: Path, username: str, password: str, use_vpn: bool) -> None:
@@ -1207,6 +1232,15 @@ class StackConfigurator:
             self._set_seerr_main(client)
             client.request("POST", "/api/v1/settings/initialize", json_body={})
 
+    def publish_remote_urls(self) -> None:
+        """Point Seerr at the public Jellyfin and request addresses once remote access exists."""
+        if not (self.settings.public_jellyfin_url or self.settings.public_seerr_url):
+            return
+        client = ApiClient(self.urls["seerr"])
+        self._login_seerr(client, with_server=False)
+        self._remember_seerr_external_url(client)
+        self._set_seerr_main(client)
+
     def _login_seerr(self, client: ApiClient, *, with_server: bool) -> None:
         body: dict[str, Any] = {
             "username": self.settings.admin_user,
@@ -1231,7 +1265,10 @@ class StackConfigurator:
             client.request(
                 "POST",
                 "/api/v1/settings/jellyfin",
-                json_body={"externalHostname": f"http://127.0.0.1:{self.settings.jellyfin_port}"},
+                json_body={
+                    "externalHostname": self.settings.public_jellyfin_url
+                    or f"http://127.0.0.1:{self.settings.jellyfin_port}"
+                },
             )
         except SetupError as error:
             self.log(f"Warning: left Seerr's public Jellyfin URL unset ({error}).")
@@ -1299,12 +1336,928 @@ class StackConfigurator:
             return
         main.pop("apiKey", None)
         main["applicationTitle"] = "Requests"
-        main["applicationUrl"] = f"http://127.0.0.1:{self.settings.seerr_port}"
+        main["applicationUrl"] = (
+            self.settings.public_seerr_url or f"http://127.0.0.1:{self.settings.seerr_port}"
+        )
         main["mediaServerType"] = 2
         client.request("POST", "/api/v1/settings/main", json_body=main)
 
 
-def collect_settings(assume_yes: bool, no_vpn: bool) -> tuple[Settings, dict[str, str]]:
+TUNNEL_NAME = "jellyfin"
+REMOTE_MODES = {"local", "cloudflare", "forward"}
+
+
+def normalize_remote_mode(value: str) -> str | None:
+    aliases = {
+        "1": "cloudflare",
+        "2": "forward",
+        "3": "tailscale",
+        "4": "local",
+        "tunnel": "cloudflare",
+        "cloudflare": "cloudflare",
+        "cf": "cloudflare",
+        "port": "forward",
+        "forward": "forward",
+        "port-forward": "forward",
+        "portforward": "forward",
+        "upnp": "forward",
+        "tailscale": "tailscale",
+        "tailnet": "tailscale",
+        "local": "local",
+        "none": "local",
+        "off": "local",
+    }
+    return aliases.get(value.strip().lower())
+
+
+def normalize_hostname(value: str) -> str:
+    host = value.strip().lower()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split("/", 1)[0].split(":", 1)[0].rstrip(".")
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+", host):
+        raise SetupError(
+            f"The hostname {value.strip()!r} needs to look like watch.example.com.\n\n"
+            "Rerun with CLOUDFLARE_HOSTNAME='watch.example.com'."
+        )
+    return host
+
+
+def install_command(settings: Settings, remote: str) -> str:
+    parts = ["./install.sh --yes"]
+    if not settings.vpn_enabled:
+        parts.append("--no-vpn")
+    if remote != "local":
+        parts.append(f"--remote {remote}")
+    return " ".join(parts)
+
+
+def cloudflare_setup_help(settings: Settings) -> str:
+    rerun = install_command(settings, "cloudflare")
+    forward = install_command(settings, "forward")
+    return (
+        "Cloudflare Tunnel still needs a domain that is already on Cloudflare, and an API token.\n\n"
+        "1. Open https://dash.cloudflare.com and confirm the domain is listed as Active.\n"
+        "2. Open https://dash.cloudflare.com/profile/api-tokens\n"
+        "3. Choose Create Token, then Create Custom Token. Add:\n"
+        "     Account    Cloudflare Tunnel    Edit\n"
+        "     Zone       DNS                  Edit\n"
+        "     Zone       Zone                 Read\n"
+        "   Include your account, and include the zone for that domain.\n"
+        "4. Copy the token and rerun:\n\n"
+        f"     CLOUDFLARE_API_TOKEN='paste-token' CLOUDFLARE_HOSTNAME='watch.example.com' {rerun}\n\n"
+        "Requests use requests.<your domain>. Set CLOUDFLARE_SEERR_HOSTNAME if you want a different name,\n"
+        "or CLOUDFLARE_SEERR_HOSTNAME=off to keep requests on this computer.\n\n"
+        "If you do not have a domain on Cloudflare, open the ports on your router instead:\n\n"
+        f"     {forward}\n\n"
+        "No domain, and the router cannot forward a port either? Use Tailscale:\n\n"
+        f"     {install_command(settings, 'tailscale')}\n\n"
+        "When Cloudflare rejects the token, the message names the missing permission. Add it on the\n"
+        "token page and rerun the same command."
+    )
+
+
+def cloudflare_error_message(status: int, payload: Any, action: str) -> str:
+    bits: list[str] = []
+    if isinstance(payload, dict):
+        for item in payload.get("errors") or []:
+            if isinstance(item, dict) and item.get("message"):
+                bits.append(str(item["message"]))
+    detail = "; ".join(bits) or "Cloudflare returned an error"
+    extra = ""
+    lowered = detail.lower()
+    if status in {401, 403} or "authentication" in lowered or "permission" in lowered or "unauthorized" in lowered:
+        extra = (
+            "\n\nThe token cannot do that yet. Open https://dash.cloudflare.com/profile/api-tokens, "
+            "edit the token, and allow Account / Cloudflare Tunnel / Edit, Zone / DNS / Edit, "
+            "and Zone / Zone / Read. Include the account and the domain's zone. Then rerun the same command."
+        )
+    elif status == 404 or ("account" in lowered and "not found" in lowered):
+        extra = (
+            "\n\nCheck CLOUDFLARE_ACCOUNT_ID. It is the short id in the dashboard URL, "
+            "right after https://dash.cloudflare.com/"
+        )
+    return f"Cloudflare could not {action}: {detail}{extra}"
+
+
+def zone_missing_message(hostname: str) -> str:
+    return (
+        f"Cloudflare has no zone that matches {hostname}.\n\n"
+        "Add that domain and wait until the dashboard shows it as Active:\n"
+        "  https://dash.cloudflare.com/?to=/:account/domains\n\n"
+        "Use the nameservers Cloudflare shows on that page.\n"
+        "Then rerun the same command. A token already saved in .env can stay there."
+    )
+
+
+def cloudflare_call(token: str, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+    url = "https://api.cloudflare.com/client/v4" + path
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("Authorization", f"Bearer {token}")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            status = response.status
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode("utf-8", errors="replace")
+        status = error.code
+    except urllib.error.URLError as error:
+        raise SetupError(
+            "Could not reach Cloudflare's API.\n\n"
+            "Check that this computer can open https://api.cloudflare.com, then rerun the same command.\n"
+            f"Detail: {error.reason}"
+        ) from error
+    try:
+        payload = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        payload = {"success": False, "errors": [{"message": raw[:500] or "empty response"}]}
+    if status >= 400 or not payload.get("success", False):
+        action = f"{method} {path.split('?', 1)[0]}"
+        raise SetupError(cloudflare_error_message(status, payload, action))
+    return payload.get("result")
+
+
+def find_cloudflare_account(settings: Settings, call: Callable[..., Any]) -> str:
+    if settings.cloudflare_account_id.strip():
+        return settings.cloudflare_account_id.strip()
+    result = call("GET", "/accounts?per_page=50")
+    accounts = result if isinstance(result, list) else []
+    if len(accounts) == 1 and accounts[0].get("id"):
+        return str(accounts[0]["id"])
+    if not accounts:
+        raise SetupError(
+            "Cloudflare returned no account for this token.\n\n"
+            "Create the token again and include your account under Account Resources.\n"
+            "https://dash.cloudflare.com/profile/api-tokens"
+        )
+    listed = ", ".join(
+        f"{item.get('name', 'account')} ({item.get('id', '')})" for item in accounts if item.get("id")
+    )
+    raise SetupError(
+        f"This token can see more than one Cloudflare account: {listed}\n\n"
+        "Rerun with CLOUDFLARE_ACCOUNT_ID set to the id you want.\n"
+        "That id is also the first piece of the dashboard URL, after https://dash.cloudflare.com/"
+    )
+
+
+def find_cloudflare_zone(call: Callable[..., Any], hostname: str) -> dict[str, Any]:
+    labels = hostname.split(".")
+    suffixes = [".".join(labels[index:]) for index in range(0, max(len(labels) - 1, 1))]
+    for name in suffixes:
+        result = call("GET", "/zones?" + urllib.parse.urlencode({"name": name, "per_page": "5"}))
+        zones = result if isinstance(result, list) else []
+        if zones:
+            return zones[0]
+    raise SetupError(zone_missing_message(hostname))
+
+
+def seerr_public_hostname(settings: Settings, zone_name: str) -> str | None:
+    raw = settings.cloudflare_seerr_hostname.strip().lower()
+    if raw in {"off", "none", "-"}:
+        return None
+    if raw:
+        return normalize_hostname(raw)
+    candidate = "requests." + zone_name
+    if candidate == settings.cloudflare_hostname:
+        return None
+    return candidate
+
+
+def find_named_tunnel(call: Callable[..., Any], account_id: str, settings: Settings) -> str | None:
+    query = urllib.parse.urlencode({"is_deleted": "false", "per_page": "50", "name": TUNNEL_NAME})
+    result = call("GET", f"/accounts/{account_id}/cfd_tunnel?{query}")
+    tunnels = result if isinstance(result, list) else []
+    wanted = settings.cloudflare_tunnel_id.strip()
+    if wanted:
+        for item in tunnels:
+            if item.get("id") == wanted and not item.get("deleted_at"):
+                return wanted
+    for item in tunnels:
+        if item.get("name") == TUNNEL_NAME and item.get("id") and not item.get("deleted_at"):
+            return str(item["id"])
+    return None
+
+
+def tunnel_token_from_result(result: Any) -> str:
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, dict) and isinstance(result.get("token"), str):
+        return str(result["token"]).strip()
+    return ""
+
+
+def upsert_tunnel_dns(call: Callable[..., Any], zone_id: str, hostname: str, tunnel_id: str) -> None:
+    target = f"{tunnel_id}.cfargotunnel.com"
+    query = urllib.parse.urlencode({"name": hostname, "per_page": "5"})
+    existing = call("GET", f"/zones/{zone_id}/dns_records?{query}")
+    records = existing if isinstance(existing, list) else []
+    body = {"type": "CNAME", "name": hostname, "content": target, "proxied": True, "ttl": 1}
+    if not records:
+        call("POST", f"/zones/{zone_id}/dns_records", body)
+        return
+    record = records[0]
+    if record.get("type") != "CNAME":
+        raise SetupError(
+            f"DNS for {hostname} is already a {record.get('type', 'record')}, so the tunnel was left alone.\n\n"
+            "In the Cloudflare dashboard, open DNS for that domain and delete or rename that record.\n"
+            f"Then rerun the same command. The tunnel will add a CNAME to {target}."
+        )
+    if record.get("content") == target and record.get("proxied") is True:
+        return
+    record_id = record.get("id")
+    if not record_id:
+        raise SetupError(
+            f"Cloudflare already has a DNS record for {hostname}, and it did not include an id to update.\n\n"
+            "Delete that record in the dashboard DNS page, then rerun the same command."
+        )
+    call("PUT", f"/zones/{zone_id}/dns_records/{record_id}", body)
+
+
+def provision_cloudflare(settings: Settings, call: Callable[..., Any] | None = None) -> str:
+    """Create or reuse a tunnel, attach Jellyfin and Requests, and store the connector token."""
+    api = call or (lambda method, path, body=None: cloudflare_call(settings.cloudflare_api_token, method, path, body))
+    account_id = find_cloudflare_account(settings, api)
+    settings.cloudflare_account_id = account_id
+    zone = find_cloudflare_zone(api, settings.cloudflare_hostname)
+    zone_id = str(zone.get("id", ""))
+    zone_name = str(zone.get("name", ""))
+    if not zone_id or not zone_name:
+        raise SetupError(zone_missing_message(settings.cloudflare_hostname))
+    seerr_host = seerr_public_hostname(settings, zone_name)
+    tunnel_id = find_named_tunnel(api, account_id, settings)
+    if tunnel_id is None:
+        created = api(
+            "POST",
+            f"/accounts/{account_id}/cfd_tunnel",
+            {"name": TUNNEL_NAME, "config_src": "cloudflare"},
+        )
+        if not isinstance(created, dict) or not created.get("id"):
+            raise SetupError(
+                "Cloudflare did not return a tunnel id.\n\n"
+                "Rerun the same command. If it happens again, create the token once more with "
+                "Cloudflare Tunnel Edit and try that token."
+            )
+        tunnel_id = str(created["id"])
+        created_token = tunnel_token_from_result(created.get("token"))
+        if created_token:
+            settings.cloudflare_tunnel_token = created_token
+    settings.cloudflare_tunnel_id = tunnel_id
+    if not settings.cloudflare_tunnel_token:
+        settings.cloudflare_tunnel_token = tunnel_token_from_result(
+            api("GET", f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token")
+        )
+    if not settings.cloudflare_tunnel_token:
+        raise SetupError(
+            "Cloudflare created the tunnel and did not return a connector token.\n\n"
+            f"Open https://one.dash.cloudflare.com/ and copy the token for the tunnel named {TUNNEL_NAME}.\n"
+            "Then rerun with CLOUDFLARE_TUNNEL_TOKEN='paste-token'."
+        )
+    ingress: list[dict[str, str]] = [
+        {"hostname": settings.cloudflare_hostname, "service": "http://jellyfin:8096"},
+    ]
+    if seerr_host:
+        ingress.append({"hostname": seerr_host, "service": "http://seerr:5055"})
+    ingress.append({"service": "http_status:404"})
+    api(
+        "PUT",
+        f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
+        {"config": {"ingress": ingress}},
+    )
+    upsert_tunnel_dns(api, zone_id, settings.cloudflare_hostname, tunnel_id)
+    if seerr_host:
+        upsert_tunnel_dns(api, zone_id, seerr_host, tunnel_id)
+        settings.cloudflare_seerr_hostname = seerr_host
+        settings.public_seerr_url = f"https://{seerr_host}"
+    else:
+        settings.cloudflare_seerr_hostname = "off"
+        settings.public_seerr_url = ""
+    settings.public_jellyfin_url = f"https://{settings.cloudflare_hostname}"
+    requests = f" Requests: {settings.public_seerr_url}." if settings.public_seerr_url else ""
+    return (
+        "Cloudflare Tunnel is attached."
+        f"{requests}\n"
+        "The service addresses inside the tunnel are http://jellyfin:8096 and http://seerr:5055.\n"
+        "Long videos can fail on a free Cloudflare plan. If playback stops, rerun with --remote forward."
+    )
+
+
+def tunnel_token_note(settings: Settings) -> str:
+    jellyfin_host = settings.cloudflare_hostname or "watch.example.com"
+    seerr_raw = settings.cloudflare_seerr_hostname.strip().lower()
+    if settings.cloudflare_hostname:
+        settings.public_jellyfin_url = f"https://{settings.cloudflare_hostname}"
+    lines = [
+        f"  {jellyfin_host}    http://jellyfin:8096",
+    ]
+    if seerr_raw not in {"off", "none", "-"}:
+        seerr_host = seerr_raw or "requests.example.com"
+        lines.append(f"  {seerr_host}    http://seerr:5055")
+        if seerr_raw:
+            settings.public_seerr_url = f"https://{seerr_host}"
+    rerun = install_command(settings, "cloudflare")
+    listed = "\n".join(lines)
+    return (
+        "A tunnel token is saved, so the connector can start. Hostnames still have to be attached in Cloudflare\n"
+        "unless an API token is set. In the tunnel, add these public hostnames:\n\n"
+        f"{listed}\n\n"
+        "Those service addresses are the Docker names on the stack network.\n"
+        "To have this command attach the hostnames for you, create an API token and rerun:\n\n"
+        f"  CLOUDFLARE_API_TOKEN='paste-token' CLOUDFLARE_HOSTNAME='{jellyfin_host}' {rerun}"
+    )
+
+
+def tunnel_log_connected(text: str) -> bool:
+    lowered = text.lower()
+    return "registered tunnel connection" in lowered
+
+
+def tunnel_log_rejected(text: str) -> bool:
+    lowered = text.lower()
+    return "invalid token" in lowered or "unauthorized: " in lowered or "token is invalid" in lowered
+
+
+def cloudflared_logs() -> str:
+    result = subprocess.run(
+        docker_command() + ["logs", "--tail", "80", "cloudflared"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return ((result.stdout or "") + (result.stderr or "")).strip()
+
+
+def tunnel_failed_message(settings: Settings, logs: str) -> str:
+    tail = "\n".join(logs.splitlines()[-15:]) or "(no log yet)"
+    local = f"http://127.0.0.1:{settings.jellyfin_port}"
+    token_hint = (
+        "The tunnel rejected the token. Replace CLOUDFLARE_TUNNEL_TOKEN in .env, or create a new API token\n"
+        "and rerun with CLOUDFLARE_API_TOKEN. The old value is still in .env until you replace it."
+        if tunnel_log_rejected(logs)
+        else "The connector did not register."
+    )
+    return (
+        "The media stack is up. The Cloudflare tunnel is not connected yet.\n\n"
+        f"Jellyfin on this computer: {local}\n\n"
+        f"{token_hint}\n"
+        "Then check:\n"
+        "  1. This computer can open outbound TCP port 7844.\n"
+        "  2. docker logs cloudflared\n"
+        f"  3. Rerun {install_command(settings, 'cloudflare')}\n\n"
+        f"Latest tunnel log:\n{tail}"
+    )
+
+
+def wait_for_cloudflared(settings: Settings) -> None:
+    deadline = time.time() + 45
+    last = ""
+    while time.time() < deadline:
+        last = cloudflared_logs()
+        if tunnel_log_connected(last):
+            target = settings.public_jellyfin_url or "the hostname attached in Cloudflare"
+            print(f"Tunnel connected. Open {target}")
+            return
+        if tunnel_log_rejected(last):
+            break
+        time.sleep(2)
+    raise SetupError(tunnel_failed_message(settings, last))
+
+
+def xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_upnp_service(xml_text: str, base_url: str) -> tuple[str, str] | None:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+    for service in root.iter():
+        if xml_local_name(service.tag) != "service":
+            continue
+        service_type = ""
+        control = ""
+        for child in list(service):
+            name = xml_local_name(child.tag)
+            if name == "serviceType":
+                service_type = (child.text or "").strip()
+            elif name == "controlURL":
+                control = (child.text or "").strip()
+        if control and ("WANIPConnection" in service_type or "WANPPPConnection" in service_type):
+            return urllib.parse.urljoin(base_url, control), service_type
+    return None
+
+
+def parse_upnp_value(xml_text: str, name: str) -> str:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return ""
+    for element in root.iter():
+        if xml_local_name(element.tag) == name and element.text:
+            return element.text.strip()
+    return ""
+
+
+def upnp_soap_body(service_type: str, action: str, fields: Mapping[str, str]) -> bytes:
+    rows = "".join(f"<{key}>{value}</{key}>" for key, value in fields.items())
+    envelope = (
+        '<?xml version="1.0"?>'
+        '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+        's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+        "<s:Body>"
+        f'<u:{action} xmlns:u="{service_type}">{rows}</u:{action}>'
+        "</s:Body></s:Envelope>"
+    )
+    return envelope.encode("utf-8")
+
+
+def http_exchange(
+    url: str,
+    data: bytes | None = None,
+    headers: Mapping[str, str] | None = None,
+    timeout: float = 8,
+) -> tuple[int, str]:
+    request = urllib.request.Request(url, data=data, headers=dict(headers or {}), method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as error:
+        raise SetupError(str(error.reason)) from error
+
+
+def discover_gateway_location(timeout: float = 3) -> str | None:
+    targets = (
+        "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+        "urn:schemas-upnp-org:service:WANIPConnection:1",
+        "upnp:rootdevice",
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    try:
+        sock.settimeout(timeout)
+        for target in targets:
+            message = (
+                "M-SEARCH * HTTP/1.1\r\n"
+                "HOST: 239.255.255.250:1900\r\n"
+                'MAN: "ssdp:discover"\r\n'
+                "MX: 1\r\n"
+                f"ST: {target}\r\n"
+                "\r\n"
+            ).encode("ascii")
+            try:
+                sock.sendto(message, ("239.255.255.250", 1900))
+            except OSError:
+                return None
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    data, _addr = sock.recvfrom(65535)
+                except socket.timeout:
+                    break
+                text = data.decode("utf-8", errors="replace")
+                for line in text.splitlines():
+                    if line.lower().startswith("location:"):
+                        location = line.split(":", 1)[1].strip()
+                        if location:
+                            return location
+    finally:
+        sock.close()
+    return None
+
+
+def lan_address() -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("1.1.1.1", 80))
+        address = sock.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+    if address.startswith("127."):
+        return ""
+    return address
+
+
+def is_public_ip(ip: str) -> bool:
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        numbers = [int(part) for part in parts]
+    except ValueError:
+        return False
+    if any(number < 0 or number > 255 for number in numbers):
+        return False
+    first, second = numbers[0], numbers[1]
+    if first in {0, 10, 127} or first >= 224:
+        return False
+    if first == 192 and second == 168:
+        return False
+    if first == 172 and 16 <= second <= 31:
+        return False
+    if first == 100 and 64 <= second <= 127:
+        return False
+    return True
+
+
+def public_ip_from_trace() -> str:
+    try:
+        status, body = http_exchange("https://1.1.1.1/cdn-cgi/trace", timeout=5)
+    except SetupError:
+        return ""
+    if status != 200:
+        return ""
+    for line in body.splitlines():
+        if line.startswith("ip="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def port_forward_steps(local_ip: str, jellyfin_port: str, seerr_port: str, public_ip: str = "") -> str:
+    host = local_ip or "this computer's LAN address (run: ip -4 addr)"
+    if public_ip:
+        phone = f"http://{public_ip}:{jellyfin_port}"
+        where = f"The public address to try is {phone}."
+    else:
+        phone = f"http://YOUR.PUBLIC.IP:{jellyfin_port}"
+        where = (
+            f"On a phone that is not on this Wi-Fi, open {phone}. "
+            "YOUR.PUBLIC.IP is the ip= line from https://1.1.1.1/cdn-cgi/trace opened on this computer."
+        )
+    return (
+        "The router did not open the ports from this computer. UPnP is often switched off. Forward them by hand:\n\n"
+        "1. Open the router admin page. It is often http://192.168.1.1, or the gateway from: ip route\n"
+        "2. Find Port Forwarding, Virtual Server, or NAT.\n"
+        f"3. Add two TCP forwards, both aimed at {host}:\n"
+        f"     external {jellyfin_port}  ->  {host}:{jellyfin_port}   Jellyfin\n"
+        f"     external {seerr_port}  ->  {host}:{seerr_port}   Requests\n"
+        "4. Save.\n"
+        f"5. {where}\n\n"
+        "Sonarr, Radarr, Prowlarr, and qBittorrent stay on this computer. Leave their ports closed.\n\n"
+        "If the phone cannot connect, the forward is aimed at a different address, or a firewall on this\n"
+        f"computer is blocking the port. On Ubuntu, run:\n"
+        f"  sudo ufw allow {jellyfin_port}/tcp && sudo ufw allow {seerr_port}/tcp\n"
+        "Then test from the phone again.\n\n"
+        "If the router cannot be changed, and you have no domain, use Tailscale. "
+        "It needs neither:\n\n"
+        "  ./install.sh --remote tailscale"
+    )
+
+
+def try_upnp_forward(
+    local_ip: str,
+    ports: list[tuple[str, str]],
+    *,
+    discover: Callable[[], str | None],
+    exchange: Callable[..., tuple[int, str]],
+) -> tuple[str, str]:
+    """Return (external_ip, error). error is empty when the router accepted the mappings."""
+    try:
+        location = discover()
+    except OSError as error:
+        return "", f"Searching the local network for the router failed ({error})."
+    if not location:
+        return "", "No UPnP router answered."
+    try:
+        status, description = exchange(location)
+    except SetupError as error:
+        return "", f"The router description page did not load ({error})."
+    if status >= 400:
+        return "", f"The router description page returned {status}."
+    parsed = parse_upnp_service(description, location)
+    if parsed is None:
+        return "", "The router answered, and it has no WAN port-forwarding service."
+    control_url, service_type = parsed
+    for port, label in ports:
+        fields = {
+            "NewRemoteHost": "",
+            "NewExternalPort": port,
+            "NewProtocol": "TCP",
+            "NewInternalPort": port,
+            "NewInternalClient": local_ip,
+            "NewEnabled": "1",
+            "NewPortMappingDescription": label,
+            "NewLeaseDuration": "0",
+        }
+        action = "AddPortMapping"
+        body = upnp_soap_body(service_type, action, fields)
+        headers = {
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction": f'"{service_type}#{action}"',
+        }
+        try:
+            map_status, map_body = exchange(control_url, data=body, headers=headers)
+        except SetupError as error:
+            return "", f"The router did not accept the forward for port {port} ({error})."
+        if map_status >= 400:
+            fault = parse_upnp_value(map_body, "errorDescription") or f"HTTP {map_status}"
+            return "", f"The router refused port {port}: {fault}."
+    try:
+        ip_body = upnp_soap_body(service_type, "GetExternalIPAddress", {})
+        ip_headers = {
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction": f'"{service_type}#GetExternalIPAddress"',
+        }
+        _status, ip_xml = exchange(control_url, data=ip_body, headers=ip_headers)
+    except SetupError:
+        return "", ""
+    return parse_upnp_value(ip_xml, "NewExternalIPAddress"), ""
+
+
+def forward_ports(
+    settings: Settings,
+    *,
+    discover: Callable[[], str | None] | None = None,
+    exchange: Callable[..., tuple[int, str]] | None = None,
+    local_ip: str | None = None,
+    lookup_public_ip: Callable[[], str] | None = None,
+) -> str:
+    address = lan_address() if local_ip is None else local_ip
+    ports = [
+        (str(settings.jellyfin_port), "jellyfin"),
+        (str(settings.seerr_port), "seerr"),
+    ]
+    finder = discover or discover_gateway_location
+    transport = exchange or http_exchange
+    if not address:
+        return (
+            "This computer's LAN address could not be detected, so the ports were not forwarded.\n\n"
+            + port_forward_steps("", settings.jellyfin_port, settings.seerr_port)
+        )
+    external_ip, error = try_upnp_forward(address, ports, discover=finder, exchange=transport)
+    if error:
+        looked_up = ""
+        if lookup_public_ip is not None:
+            looked_up = lookup_public_ip()
+        elif exchange is None:
+            looked_up = public_ip_from_trace()
+        return error + "\n\n" + port_forward_steps(address, settings.jellyfin_port, settings.seerr_port, looked_up)
+    if not external_ip:
+        if lookup_public_ip is not None:
+            external_ip = lookup_public_ip()
+        elif exchange is None:
+            external_ip = public_ip_from_trace()
+    if not is_public_ip(external_ip):
+        shown = external_ip or "a private address"
+        return (
+            f"The router accepted the forward and reported its outside address as {shown}. "
+            "That address is private or assigned by the carrier, so the open port still does not reach the internet.\n\n"
+            "Use Tailscale instead. It needs no domain and no open port:\n\n"
+            f"  {install_command(settings, 'tailscale')}\n\n"
+            "Install Tailscale on the phone or computer you watch from, and sign in with the same account."
+        )
+    settings.public_jellyfin_url = f"http://{external_ip}:{settings.jellyfin_port}"
+    settings.public_seerr_url = f"http://{external_ip}:{settings.seerr_port}"
+    return (
+        f"The router accepted a forward to {address}.\n"
+        "Open the Jellyfin address from a phone that is not on this Wi-Fi.\n"
+        "If it does not load, log in to the router and check that the forward still points at "
+        f"{address}. Some routers turn UPnP off after a restart.\n"
+        "If a firewall on this computer blocks the ports, run:\n"
+        f"  sudo ufw allow {settings.jellyfin_port}/tcp && sudo ufw allow {settings.seerr_port}/tcp"
+    )
+
+
+def tailscale_auth_url(text: str) -> str:
+    match = re.search(r"https://login\.tailscale\.com/\S+", text)
+    return match.group(0).rstrip(").,") if match else ""
+
+
+def tailscale_address(payload: Mapping[str, Any]) -> tuple[str, str]:
+    self_info = payload.get("Self") if isinstance(payload.get("Self"), dict) else {}
+    ips = self_info.get("TailscaleIPs") or payload.get("TailscaleIPs") or []
+    ipv4 = ""
+    if isinstance(ips, list):
+        ipv4 = next((str(ip) for ip in ips if "." in str(ip)), "")
+    dns = str(self_info.get("DNSName") or "").rstrip(".")
+    return ipv4, dns
+
+
+def tailscale_install_note(settings: Settings) -> str:
+    rerun = install_command(settings, "tailscale")
+    if sys.platform.startswith("linux"):
+        install = "curl -fsSL https://tailscale.com/install.sh | sh"
+    elif sys.platform == "darwin":
+        install = "Install the macOS app from https://tailscale.com/download/mac"
+    else:
+        install = "Install Tailscale from https://tailscale.com/download"
+    return (
+        "Tailscale reaches Jellyfin with no domain and no open router port.\n"
+        "It is not installed on this computer yet.\n\n"
+        f"1. {install}\n"
+        "2. Run: sudo tailscale up\n"
+        "3. Open the link it prints. Sign in, or create a free account.\n"
+        f"4. Rerun {rerun}\n\n"
+        "On the phone or computer you watch from, install Tailscale from https://tailscale.com/download\n"
+        "and sign in with that same account. Rerun the command above and it will print the address to open."
+    )
+
+
+def tailscale_login_note(settings: Settings, auth_url: str) -> str:
+    rerun = install_command(settings, "tailscale")
+    if auth_url:
+        steps = (
+            f"1. Open {auth_url}\n"
+            "2. Sign in, or create a free Tailscale account. No domain is required.\n"
+            f"3. Rerun {rerun}"
+        )
+    else:
+        steps = (
+            "1. Run: sudo tailscale up\n"
+            "2. Open the link it prints. Sign in, or create a free account.\n"
+            f"3. Rerun {rerun}\n\n"
+            "If sudo asks for a password, run that command in a terminal on this computer."
+        )
+    return (
+        "Tailscale reaches Jellyfin with no domain and no open router port.\n"
+        "This computer is not signed in yet.\n\n"
+        f"{steps}\n\n"
+        "On the phone or computer you watch from, install Tailscale from https://tailscale.com/download\n"
+        "and sign in with that same account.\n"
+        "If the link expired, run sudo tailscale up again and open the new link."
+    )
+
+
+def describe_tailscale(settings: Settings, payload: Mapping[str, Any] | None, auth_url: str = "", installed: bool = True) -> str:
+    if not installed:
+        return tailscale_install_note(settings)
+    if not isinstance(payload, Mapping) or payload.get("BackendState") != "Running":
+        found = auth_url or (str(payload.get("AuthURL") or "") if isinstance(payload, Mapping) else "")
+        return tailscale_login_note(settings, tailscale_auth_url(found) or found.strip())
+    ipv4, dns = tailscale_address(payload)
+    host = ipv4 or dns
+    if not host:
+        return (
+            "Tailscale is signed in and did not report an address.\n\n"
+            "Run: tailscale ip -4\n"
+            f"Then rerun {install_command(settings, 'tailscale')}"
+        )
+    settings.public_jellyfin_url = f"http://{host}:{settings.jellyfin_port}"
+    settings.public_seerr_url = f"http://{host}:{settings.seerr_port}"
+    lines = [
+        "Tailscale is signed in. Install Tailscale on the phone or computer you watch from and sign in with the same account:",
+        "  https://tailscale.com/download",
+        f"Then open {settings.public_jellyfin_url}",
+    ]
+    if dns and dns != host:
+        lines.append(f"With MagicDNS on, this name also works: http://{dns}:{settings.jellyfin_port}")
+    lines.append(
+        f"Requests use port {settings.seerr_port} on that same address. "
+        "No domain and no router port are required."
+    )
+    return "\n".join(lines)
+
+
+def read_tailscale_status() -> dict[str, Any] | None:
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        payload = json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def begin_tailscale_login() -> str:
+    command = ["tailscale", "up"]
+    if hasattr(os, "geteuid") and os.geteuid() != 0 and shutil.which("sudo"):
+        command = ["sudo", "-n", "tailscale", "up"]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError:
+        return ""
+    collected: list[str] = []
+    deadline = time.time() + 12
+    stream = process.stdout
+    while time.time() < deadline and stream is not None:
+        ready, _, _ = select.select([stream], [], [], 0.5)
+        if not ready:
+            if process.poll() is not None:
+                break
+            continue
+        line = stream.readline()
+        if not line:
+            break
+        collected.append(line)
+        url = tailscale_auth_url(line)
+        if url:
+            return url
+    return tailscale_auth_url("".join(collected))
+
+
+def try_install_tailscale() -> bool:
+    if shutil.which("tailscale"):
+        return True
+    if not sys.platform.startswith("linux") or shutil.which("curl") is None or shutil.which("sudo") is None:
+        return False
+    print("Installing Tailscale...")
+    result = subprocess.run(
+        "curl -fsSL https://tailscale.com/install.sh | sudo sh",
+        shell=True,
+        check=False,
+    )
+    return result.returncode == 0 and shutil.which("tailscale") is not None
+
+
+def setup_tailscale(settings: Settings) -> str:
+    installed = shutil.which("tailscale") is not None or try_install_tailscale()
+    if not installed:
+        return describe_tailscale(settings, None, installed=False)
+    payload = read_tailscale_status()
+    auth_url = ""
+    if not payload or payload.get("BackendState") != "Running":
+        auth_url = begin_tailscale_login()
+        payload = read_tailscale_status() or payload
+    return describe_tailscale(settings, payload, auth_url)
+
+
+def choose_remote_access(settings: Settings, existing: Mapping[str, str], assume_yes: bool, remote: str | None) -> None:
+    if remote:
+        mode = normalize_remote_mode(remote)
+        if mode is None:
+            raise SetupError(
+                f"Unknown remote access {remote!r}. Use cloudflare, forward, tailscale, or local.\n\n"
+                "  ./install.sh --remote cloudflare\n"
+                "  ./install.sh --remote forward\n"
+                "  ./install.sh --remote tailscale\n"
+                "  ./install.sh --remote local"
+            )
+        settings.remote_access = mode
+    elif "REMOTE_ACCESS" not in existing and not assume_yes and sys.stdin.isatty():
+        print()
+        print("Reach Jellyfin from outside this computer:")
+        print("  1  Cloudflare Tunnel (no router changes; the domain must already be on Cloudflare)")
+        print("  2  Port forwarding (open Jellyfin on your router)")
+        print("  3  Tailscale (no domain and no router changes)")
+        print("  4  This computer only")
+        mode = normalize_remote_mode(prompt("Choice", "4"))
+        if mode is None:
+            raise SetupError("Type 1, 2, 3, or 4. Then rerun ./install.sh.")
+        settings.remote_access = mode
+    elif "REMOTE_ACCESS" not in existing:
+        settings.remote_access = "local"
+    else:
+        mode = normalize_remote_mode(settings.remote_access)
+        if mode is None:
+            raise SetupError(
+                f"REMOTE_ACCESS={settings.remote_access!r} is not local, cloudflare, forward, or tailscale.\n\n"
+                "Edit .env or rerun with --remote cloudflare, --remote forward, --remote tailscale, or --remote local."
+            )
+        settings.remote_access = mode
+
+    settings.cloudflare_api_token = settings.cloudflare_api_token.strip()
+    settings.cloudflare_tunnel_token = settings.cloudflare_tunnel_token.strip()
+    if settings.remote_access != "cloudflare":
+        return
+    interactive = not assume_yes and sys.stdin.isatty()
+    if interactive and not settings.cloudflare_hostname:
+        settings.cloudflare_hostname = prompt("Jellyfin hostname (watch.example.com)", "")
+    if interactive and not settings.cloudflare_api_token and not settings.cloudflare_tunnel_token:
+        settings.cloudflare_api_token = prompt("Cloudflare API token", "", secret=True)
+    settings.cloudflare_api_token = settings.cloudflare_api_token.strip()
+    settings.cloudflare_tunnel_token = settings.cloudflare_tunnel_token.strip()
+    if settings.cloudflare_hostname.strip():
+        settings.cloudflare_hostname = normalize_hostname(settings.cloudflare_hostname)
+    seerr_name = settings.cloudflare_seerr_hostname.strip()
+    if seerr_name and seerr_name.lower() not in {"off", "none", "-"}:
+        settings.cloudflare_seerr_hostname = normalize_hostname(seerr_name)
+    elif seerr_name:
+        settings.cloudflare_seerr_hostname = seerr_name.lower()
+
+
+def require_cloudflare_credentials(settings: Settings) -> None:
+    """Fail before Docker starts when the tunnel was requested and the login is still missing."""
+    if settings.remote_access != "cloudflare":
+        return
+    if not settings.cloudflare_api_token and not settings.cloudflare_tunnel_token:
+        raise SetupError(cloudflare_setup_help(settings))
+    if settings.cloudflare_api_token and not settings.cloudflare_hostname and not settings.cloudflare_tunnel_token:
+        raise SetupError(
+            "Cloudflare needs the hostname people will open, such as watch.example.com.\n\n"
+            "Rerun with CLOUDFLARE_HOSTNAME='watch.example.com' and the same --remote cloudflare command."
+        )
+
+
+def collect_settings(assume_yes: bool, no_vpn: bool, remote: str | None = None) -> tuple[Settings, dict[str, str]]:
     existing = merged_env()
     settings = Settings.from_mapping(existing)
     if not settings.puid or settings.puid == "1000" and "PUID" not in existing:
@@ -1380,6 +2333,7 @@ def collect_settings(assume_yes: bool, no_vpn: bool) -> tuple[Settings, dict[str
                     "To run with downloads on the normal network instead:\n\n"
                     "  ./install.sh --yes --no-vpn"
                 )
+    choose_remote_access(settings, existing, assume_yes, remote)
     return settings, {key: value for key, value in existing.items() if key.startswith("GLUETUN_")}
 
 
@@ -1394,11 +2348,15 @@ def docker_command() -> list[str]:
     raise SetupError(probe.stderr.strip() or "docker info failed")
 
 
-def compose_up(use_vpn: bool) -> None:
+def compose_up(use_vpn: bool, services: list[str] | None = None) -> None:
     compose_file = ROOT / ("docker-compose.yml" if use_vpn else "docker-compose.novpn.yml")
     if not compose_file.exists():
         compose_file.write_text(render_compose(use_vpn), encoding="utf-8")
-    command = docker_command() + ["compose", "-f", str(compose_file), "up", "-d", "--remove-orphans"]
+    command = docker_command() + ["compose", "-f", str(compose_file), "up", "-d"]
+    if not services:
+        command.append("--remove-orphans")
+    if services:
+        command.extend(services)
     subprocess.run(command, check=True, cwd=ROOT)
 
 
@@ -1408,7 +2366,7 @@ def restart_service(service: str, use_vpn: bool) -> None:
     subprocess.run(command, check=True, cwd=ROOT)
 
 
-def write_credentials(settings: Settings, api_keys: Mapping[str, str]) -> None:
+def write_credentials(settings: Settings, api_keys: Mapping[str, str], remote_note: str = "") -> None:
     lines = [
         "Automated Jellyfin stack",
         "",
@@ -1449,35 +2407,93 @@ def write_credentials(settings: Settings, api_keys: Mapping[str, str]) -> None:
         )
     lines.append("Add indexers you subscribe to in Prowlarr. They sync to Sonarr and Radarr.")
     lines.append("")
+    if settings.public_jellyfin_url or settings.public_seerr_url or remote_note.strip():
+        lines.append("Away from this computer")
+        if settings.public_jellyfin_url:
+            lines.append(f"Jellyfin     {settings.public_jellyfin_url}")
+        if settings.public_seerr_url:
+            lines.append(f"Requests     {settings.public_seerr_url}")
+        lines.append("Sonarr, Radarr, Prowlarr, and qBittorrent stay on this computer.")
+        if remote_note.strip():
+            lines.append(remote_note.strip())
+        lines.append("")
     CREDENTIALS_PATH.write_text("\n".join(lines), encoding="utf-8")
     os.chmod(CREDENTIALS_PATH, 0o600)
 
 
-def install(assume_yes: bool, no_vpn: bool, configure_only: bool) -> None:
-    settings, extras = collect_settings(assume_yes=assume_yes, no_vpn=no_vpn)
+def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | None = None) -> None:
+    settings, extras = collect_settings(assume_yes=assume_yes, no_vpn=no_vpn, remote=remote)
     write_env_file(ENV_PATH, settings, extras)
+    require_cloudflare_credentials(settings)
+    remote_note = ""
+    cloudflare_error = ""
+    try:
+        if settings.remote_access == "cloudflare" and settings.cloudflare_api_token:
+            print("Setting up the Cloudflare tunnel...")
+            remote_note = provision_cloudflare(settings)
+        elif settings.remote_access == "cloudflare":
+            remote_note = tunnel_token_note(settings)
+    except SetupError as error:
+        cloudflare_error = str(error)
+        remote_note = cloudflare_error
+    finally:
+        write_env_file(ENV_PATH, settings, extras)
     prepare_directories(settings)
     gluetun_names = [key.removeprefix("GLUETUN_") for key in extras]
-    (ROOT / "docker-compose.yml").write_text(render_compose(True, gluetun_names), encoding="utf-8")
-    (ROOT / "docker-compose.novpn.yml").write_text(render_compose(False), encoding="utf-8")
+    use_tunnel = settings.remote_access == "cloudflare" and bool(settings.cloudflare_tunnel_token)
+    (ROOT / "docker-compose.yml").write_text(
+        render_compose(True, gluetun_names, cloudflare=use_tunnel),
+        encoding="utf-8",
+    )
+    (ROOT / "docker-compose.novpn.yml").write_text(
+        render_compose(False, cloudflare=use_tunnel),
+        encoding="utf-8",
+    )
     if not configure_only:
         print("Starting containers...")
         compose_up(settings.vpn_enabled)
+    elif use_tunnel:
+        print("Starting the Cloudflare tunnel...")
+        compose_up(settings.vpn_enabled, services=["cloudflared"])
     configurator = StackConfigurator(
         settings,
         restarter=lambda service: restart_service(service, settings.vpn_enabled),
     )
     configurator.configure()
-    write_credentials(settings, configurator.api_keys)
+    if settings.remote_access == "forward":
+        print("Opening Jellyfin and Requests on the router...")
+        remote_note = forward_ports(settings)
+        write_env_file(ENV_PATH, settings, extras)
+    elif settings.remote_access == "tailscale":
+        print("Connecting Tailscale...")
+        remote_note = setup_tailscale(settings)
+        write_env_file(ENV_PATH, settings, extras)
+    if settings.public_jellyfin_url or settings.public_seerr_url:
+        try:
+            configurator.publish_remote_urls()
+        except SetupError as error:
+            remote_note += (
+                f"\n\nSeerr did not save the public address ({error}). "
+                "Jellyfin can still use the address above. Rerun ./install.sh once Seerr is up."
+            )
+    write_credentials(settings, configurator.api_keys, remote_note)
     print()
     print(CREDENTIALS_PATH.read_text(encoding="utf-8"))
     print(f"Saved to {CREDENTIALS_PATH}")
+    if cloudflare_error:
+        raise SetupError(cloudflare_error)
+    if use_tunnel:
+        wait_for_cloudflared(settings)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Install and configure the automated Jellyfin stack.")
     parser.add_argument("--yes", action="store_true", help="Accept defaults and environment variables without prompting.")
     parser.add_argument("--no-vpn", action="store_true", help="Do not route downloads through Gluetun.")
+    parser.add_argument(
+        "--remote",
+        help="Reach Jellyfin from outside this computer: cloudflare, forward, tailscale, or local.",
+    )
     parser.add_argument("--configure-only", action="store_true", help="Skip docker compose and only configure running apps.")
     parser.add_argument("--render-only", action="store_true", help="Write compose files and exit.")
     parser.add_argument(
@@ -1500,12 +2516,24 @@ def main(argv: list[str] | None = None) -> int:
             (ROOT / "docker-compose.yml").write_text(render_compose(True), encoding="utf-8")
             (ROOT / "docker-compose.novpn.yml").write_text(render_compose(False), encoding="utf-8")
             return 0
-        install(assume_yes=args.yes, no_vpn=args.no_vpn, configure_only=args.configure_only)
+        install(
+            assume_yes=args.yes,
+            no_vpn=args.no_vpn,
+            configure_only=args.configure_only,
+            remote=args.remote,
+        )
     except SetupError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as error:
-        print(f"error: command failed ({error.returncode}): {' '.join(error.cmd)}", file=sys.stderr)
+        hint = ""
+        if "compose" in error.cmd:
+            hint = (
+                "\n\nDocker did not start the containers. Read the Docker lines above.\n"
+                "If they say the port is already in use, change that port in .env and rerun ./install.sh.\n"
+                "If they say permission denied, rerun ./install.sh so it can use sudo for Docker."
+            )
+        print(f"error: command failed ({error.returncode}): {' '.join(error.cmd)}{hint}", file=sys.stderr)
         return error.returncode or 1
     except KeyboardInterrupt:
         print("\nStopped.", file=sys.stderr)
