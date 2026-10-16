@@ -192,8 +192,35 @@ def verify_qbittorrent_secret(secret: str, password: str) -> bool:
     return secrets.compare_digest(actual, expected)
 
 
+def can_prompt() -> bool:
+    """True when a person can answer, including curl | bash where stdin is the script."""
+    if sys.stdin.isatty():
+        return True
+    return os.path.exists("/dev/tty")
+
+
+def read_answer(prompt_text: str) -> str | None:
+    if sys.stdin.isatty():
+        try:
+            return input(prompt_text)
+        except EOFError:
+            return None
+    try:
+        tty = open("/dev/tty", "r", encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        print(prompt_text, end="", flush=True)
+        line = tty.readline()
+    finally:
+        tty.close()
+    if not line:
+        return None
+    return line
+
+
 def prompt(label: str, default: str = "", secret: bool = False, assume_yes: bool = False) -> str:
-    if assume_yes or not sys.stdin.isatty():
+    if assume_yes or not can_prompt():
         return default
     if secret:
         if default:
@@ -201,15 +228,20 @@ def prompt(label: str, default: str = "", secret: bool = False, assume_yes: bool
         typed = getpass.getpass(f"{label}: ")
         return typed or default
     shown = f" [{default}]" if default else ""
-    typed = input(f"{label}{shown}: ").strip()
-    return typed or default
+    typed_line = read_answer(f"{label}{shown}: ")
+    if typed_line is None:
+        return default
+    return typed_line.strip() or default
 
 
 def confirm(label: str, default: bool = True, assume_yes: bool = False) -> bool:
-    if assume_yes or not sys.stdin.isatty():
+    if assume_yes or not can_prompt():
         return default
     hint = "Y/n" if default else "y/N"
-    typed = input(f"{label} [{hint}]: ").strip().lower()
+    typed_line = read_answer(f"{label} [{hint}]: ")
+    if typed_line is None:
+        return default
+    typed = typed_line.strip().lower()
     if not typed:
         return default
     return typed in {"y", "yes"}
@@ -2179,7 +2211,11 @@ def try_install_tailscale() -> bool:
 
 
 def setup_tailscale(settings: Settings) -> str:
-    installed = shutil.which("tailscale") is not None or try_install_tailscale()
+    if shutil.which("tailscale"):
+        print("Tailscale is already installed.")
+        installed = True
+    else:
+        installed = try_install_tailscale()
     if not installed:
         return describe_tailscale(settings, None, installed=False)
     payload = read_tailscale_status()
@@ -2421,8 +2457,88 @@ def write_credentials(settings: Settings, api_keys: Mapping[str, str], remote_no
     os.chmod(CREDENTIALS_PATH, 0o600)
 
 
+APP_PARTS = (
+    ("jellyfin", "Jellyfin"),
+    ("seerr", "Seerr"),
+    ("radarr", "Radarr"),
+    ("sonarr", "Sonarr"),
+    ("prowlarr", "Prowlarr"),
+    ("qbittorrent", "qBittorrent"),
+    ("flaresolverr", "FlareSolverr"),
+    ("gluetun", "Gluetun"),
+)
+
+
+def classify_install(
+    config_dir: Path,
+    containers: Iterable[str],
+    *,
+    use_vpn: bool,
+    env_exists: bool,
+) -> tuple[list[str], list[str]]:
+    """Split the stack into what is already on disk and what still needs installing."""
+    names = {item.strip().lower() for item in containers}
+    present: list[str] = []
+    missing: list[str] = []
+    if env_exists:
+        present.append("Saved settings (.env)")
+    for folder, label in APP_PARTS:
+        if folder == "gluetun" and not use_vpn:
+            continue
+        if (config_dir / folder).exists() or folder in names:
+            present.append(label)
+        else:
+            missing.append(label)
+    return present, missing
+
+
+def list_container_names() -> list[str]:
+    try:
+        command = docker_command()
+    except SetupError:
+        return []
+    result = subprocess.run(
+        command + ["ps", "-a", "--format", "{{.Names}}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def review_existing(settings: Settings, assume_yes: bool) -> bool:
+    """Ask before changing config that is already here. Missing apps are still installed."""
+    config_dir = Path(settings.config_dir)
+    if not config_dir.is_absolute():
+        config_dir = ROOT / config_dir
+    present, missing = classify_install(
+        config_dir,
+        list_container_names(),
+        use_vpn=settings.vpn_enabled,
+        env_exists=ENV_PATH.exists(),
+    )
+    if not present:
+        print("Installing Jellyfin, Seerr, Radarr, Sonarr, Prowlarr, qBittorrent, and FlareSolverr.")
+        return True
+    print("Already on this computer:")
+    for item in present:
+        print(f"  {item}")
+    if missing:
+        print("Still to install:")
+        for item in missing:
+            print(f"  {item}")
+    return confirm(
+        "Check the existing config and repair anything that is disconnected",
+        default=True,
+        assume_yes=assume_yes,
+    )
+
+
 def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | None = None) -> None:
     settings, extras = collect_settings(assume_yes=assume_yes, no_vpn=no_vpn, remote=remote)
+    repair = review_existing(settings, assume_yes=assume_yes)
     write_env_file(ENV_PATH, settings, extras)
     require_cloudflare_credentials(settings)
     remote_note = ""
@@ -2450,7 +2566,7 @@ def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | 
         encoding="utf-8",
     )
     if not configure_only:
-        print("Starting containers...")
+        print("Starting containers..." if repair else "Starting anything that is not running yet...")
         compose_up(settings.vpn_enabled)
     elif use_tunnel:
         print("Starting the Cloudflare tunnel...")
@@ -2459,7 +2575,11 @@ def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | 
         settings,
         restarter=lambda service: restart_service(service, settings.vpn_enabled),
     )
-    configurator.configure()
+    if repair:
+        configurator.configure()
+    else:
+        print("Left the existing app settings in place.")
+        print("Answer yes to the check next time when you want those accounts linked.")
     if settings.remote_access == "forward":
         print("Opening Jellyfin and Requests on the router...")
         remote_note = forward_ports(settings)
@@ -2468,7 +2588,7 @@ def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | 
         print("Connecting Tailscale...")
         remote_note = setup_tailscale(settings)
         write_env_file(ENV_PATH, settings, extras)
-    if settings.public_jellyfin_url or settings.public_seerr_url:
+    if repair and (settings.public_jellyfin_url or settings.public_seerr_url):
         try:
             configurator.publish_remote_urls()
         except SetupError as error:
@@ -2476,10 +2596,20 @@ def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | 
                 f"\n\nSeerr did not save the public address ({error}). "
                 "Jellyfin can still use the address above. Rerun ./install.sh once Seerr is up."
             )
-    write_credentials(settings, configurator.api_keys, remote_note)
     print()
-    print(CREDENTIALS_PATH.read_text(encoding="utf-8"))
-    print(f"Saved to {CREDENTIALS_PATH}")
+    if repair:
+        write_credentials(settings, configurator.api_keys, remote_note)
+        print(CREDENTIALS_PATH.read_text(encoding="utf-8"))
+        print(f"Saved to {CREDENTIALS_PATH}")
+    elif CREDENTIALS_PATH.exists():
+        print(CREDENTIALS_PATH.read_text(encoding="utf-8"))
+        print(f"Saved to {CREDENTIALS_PATH}")
+        if remote_note.strip():
+            print(remote_note.strip())
+    else:
+        print("Accounts were not created. Rerun the command and answer yes to the config check.")
+        if remote_note.strip():
+            print(remote_note.strip())
     if cloudflare_error:
         raise SetupError(cloudflare_error)
     if use_tunnel:
@@ -2487,7 +2617,10 @@ def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | 
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Install and configure the automated Jellyfin stack.")
+    parser = argparse.ArgumentParser(
+        prog="install.sh",
+        description="Install and configure the automated Jellyfin stack.",
+    )
     parser.add_argument("--yes", action="store_true", help="Accept defaults and environment variables without prompting.")
     parser.add_argument("--no-vpn", action="store_true", help="Do not route downloads through Gluetun.")
     parser.add_argument(

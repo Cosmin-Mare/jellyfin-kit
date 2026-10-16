@@ -858,6 +858,39 @@ class StacklibTests(unittest.TestCase):
         self.assertIn("sudo tailscale up", note)
         self.assertEqual(settings.public_jellyfin_url, "")
 
+    def test_classify_install_keeps_what_is_present_and_names_the_rest(self):
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp)
+            (config / "jellyfin").mkdir()
+            (config / "qbittorrent").mkdir()
+            present, missing = stacklib.classify_install(
+                config,
+                ["jellyfin"],
+                use_vpn=False,
+                env_exists=True,
+            )
+        self.assertIn("Saved settings (.env)", present)
+        self.assertIn("Jellyfin", present)
+        self.assertIn("qBittorrent", present)
+        self.assertIn("Seerr", missing)
+        self.assertIn("Radarr", missing)
+        self.assertIn("Sonarr", missing)
+        self.assertIn("Prowlarr", missing)
+        self.assertIn("FlareSolverr", missing)
+        self.assertNotIn("Gluetun", missing)
+        self.assertNotIn("Gluetun", present)
+
+    def test_classify_install_includes_the_vpn_when_it_is_in_use(self):
+        with TemporaryDirectory() as tmp:
+            present, missing = stacklib.classify_install(
+                Path(tmp),
+                [],
+                use_vpn=True,
+                env_exists=False,
+            )
+        self.assertIn("Gluetun", missing)
+        self.assertEqual(present, [])
+
     def test_private_and_public_addresses(self):
         self.assertFalse(stacklib.is_public_ip("192.168.1.4"))
         self.assertFalse(stacklib.is_public_ip("10.1.1.1"))

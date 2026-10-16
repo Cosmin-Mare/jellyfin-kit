@@ -14,16 +14,23 @@ This text only prints the steps. The install command at the end is the
 one that pulls container images.
 
 1. Start the server
-   On Linux, from a checkout of this repo:
+   On Linux this also installs Docker and Python 3 when they are missing.
+   On a Mac or Windows machine, install Docker Desktop first.
 
-       ./install.sh
+       curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/install.sh | bash
 
-   It asks for an admin password, a VPN login if you want one, and how
-   to open Jellyfin from outside. Press Enter to keep the generated
-   password. Answer no to the VPN, or pass an OpenVPN login you already
-   have (the guide uses IVPN). To skip the questions:
+   The files land in ~/jellyfin-kit. It asks for an admin password, a VPN
+   login if you want one, and how to open Jellyfin from outside. Press
+   Enter to keep the generated password. Answer no to the VPN, or pass
+   an OpenVPN login you already have (the guide uses IVPN).
 
-       ./install.sh --yes --no-vpn
+   If Docker or any app is already installed, the command says so. When
+   a config is already there, it asks before repairing it, and it still
+   installs whatever is missing.
+
+   To skip the questions:
+
+       curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/install.sh | bash -s -- --yes --no-vpn
 
    The password is printed and saved in credentials.txt. The same login
    is used for every app below.

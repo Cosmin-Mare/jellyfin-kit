@@ -19,11 +19,13 @@ This follows [Bryce Hoehn's automated Jellyfin guide](https://github.com/bryce-h
 
 ## 1. Start the server
 
-On a Linux machine, install [Docker](https://docs.docker.com/engine/install/) if `docker` is not already a command. Docker Desktop is the install on macOS and Windows. Then, from a checkout of this repo:
+On Linux, this installs Docker and Python 3 when they are missing. On macOS or Windows, install [Docker Desktop](https://docs.docker.com/desktop/), start it, then run the same command.
 
 ```bash
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/install.sh | bash
 ```
+
+The files land in `~/jellyfin-kit`. Your movies, config, and password stay there if you run it again.
 
 The command asks three things:
 
@@ -31,23 +33,29 @@ The command asks three things:
 2. Whether downloads should go through a VPN. The guide uses [IVPN](https://www.ivpn.net/) over OpenVPN. Gluetun cannot create that account for you. Paste the OpenVPN user and password from a provider Gluetun supports, or answer no and downloads use your normal network.
 3. How you want to open the player and the search page from outside the house. Press 4 to keep them on this computer for now. The choices are in step 4.
 
+If Docker, Python, or any of the apps are already installed, the command says so. When an app's config is already there, it asks before repairing it, and it still installs whatever is missing. Press Enter to allow the repair. `./install.sh --yes` allows it without asking.
+
 To skip the questions:
 
 ```bash
-./install.sh --yes --no-vpn
+curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/install.sh | bash -s -- --yes --no-vpn
 ```
 
 With a VPN account you already have:
 
 ```bash
-OPENVPN_USER='your-vpn-user' OPENVPN_PASSWORD='your-vpn-password' ./install.sh --yes
+curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/install.sh | \
+  OPENVPN_USER='your-vpn-user' OPENVPN_PASSWORD='your-vpn-password' bash -s -- --yes
 ```
 
 WireGuard instead of OpenVPN:
 
 ```bash
-VPN_TYPE=wireguard WIREGUARD_PRIVATE_KEY='...' WIREGUARD_ADDRESSES='10.x.x.x/32' ./install.sh --yes
+curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/install.sh | \
+  VPN_TYPE=wireguard WIREGUARD_PRIVATE_KEY='...' WIREGUARD_ADDRESSES='10.x.x.x/32' bash -s -- --yes
 ```
+
+From a checkout of this repo, `./install.sh` does the same thing in that directory.
 
 Provider names and extra settings are in the [Gluetun wiki](https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers). An extra setting uses a `GLUETUN_` prefix, so `GLUETUN_SERVER_COUNTRIES=Netherlands` becomes `SERVER_COUNTRIES` in the container.
 
@@ -60,7 +68,7 @@ With the VPN on, qBittorrent, Prowlarr, and FlareSolverr leave through the VPN. 
 If the command stops early, read the message and run the command it prints. Two common ones:
 
 - The VPN login is missing. Pass `OPENVPN_USER` and `OPENVPN_PASSWORD`, or rerun with `--no-vpn`.
-- Docker could not start. On Linux, rerun `./install.sh`. On macOS or Windows, install Docker Desktop, start it, and rerun `./install.sh`.
+- Docker could not start. On Linux, run `sudo systemctl start docker` and rerun the curl command. On macOS or Windows, open Docker Desktop and rerun it.
 
 ## 2. Add an indexer
 
@@ -164,7 +172,7 @@ If the link expired, run `sudo tailscale up`, open the new link, and rerun the i
 
 Put files you already have in `media/movies` and `media/tv`, then scan the library in Jellyfin. New downloads land in `downloads/completed`. Sonarr and Radarr move them into the libraries.
 
-Run `./install.sh` again to repair the links. It keeps the password already in `.env`. `./install.sh --configure-only` skips Docker and only redoes the accounts.
+Run the curl command again, or `./install.sh` from `~/jellyfin-kit`, to repair the links. It keeps the password already in `.env` and asks before changing a config that is already there. `./install.sh --configure-only` skips Docker and only redoes the accounts.
 
 Stop the stack from this directory:
 
@@ -182,7 +190,7 @@ Paths, ports, timezone, and the admin login can be set in `.env` before you run 
 
 ## Read the path before installing
 
-`bash script.sh` and `./install.sh --dry-run` print the same steps and do not install Docker, pull images, or download a film. From anywhere, once this repo is public:
+`bash script.sh` and `./install.sh --dry-run` print the steps and do not install Docker, pull images, or download a film:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/script.sh | bash
