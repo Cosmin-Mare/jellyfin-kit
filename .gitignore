@@ -1,0 +1,10 @@
+.env
+config/
+media/
+downloads/
+credentials.txt
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+agent-tools/
