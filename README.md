@@ -1,8 +1,21 @@
-# Jellyfin at home, one command
+# Search, download, and play, one command
 
-This follows [Bryce Hoehn's automated Jellyfin guide](https://github.com/bryce-hoehn/automated-jellyfin-guide) (mirror of [the Codeberg original](https://codeberg.org/bhoehn/automated-jellyfin-guide)). The guide builds a home server from Jellyfin, qBittorrent, Gluetun, Prowlarr, FlareSolverr, Sonarr, and Radarr, then asks you to create each account in a browser. Here, one command installs that stack and creates the accounts.
+One command installs the whole server and signs in to every part of it. Jellyfin is the player. The rest is what finds a title, grabs the torrent, and files it into the library:
 
-You end with a movie library, a TV library, and a request page. The same login works on every app.
+| Piece | App | What you use it for |
+| --- | --- | --- |
+| Player | Jellyfin | Watch movies and shows at http://127.0.0.1:8096 |
+| Library search | Seerr | Search and request a movie or series at http://127.0.0.1:5055 |
+| Movies | Radarr | Takes a movie request, searches, and files it into `media/movies` |
+| TV | Sonarr | Same path for series, filed into `media/tv` |
+| Indexers | Prowlarr | Where the search looks. You add your indexer account here once |
+| Torrent client | qBittorrent | Downloads the release Radarr or Sonarr picked |
+| Indexer helper | FlareSolverr | Lets Prowlarr reach indexers that require a browser check |
+| VPN | Gluetun | Optional. Puts the torrent client and Prowlarr on a VPN you already have |
+
+The same username and password work on all of them. It is printed at the end and saved in `credentials.txt`.
+
+This follows [Bryce Hoehn's automated Jellyfin guide](https://github.com/bryce-hoehn/automated-jellyfin-guide) (mirror of [the Codeberg original](https://codeberg.org/bhoehn/automated-jellyfin-guide)). That guide has you create each account in a browser. Here the command does that.
 
 ## 1. Start the server
 
@@ -14,9 +27,9 @@ On a Linux machine, install [Docker](https://docs.docker.com/engine/install/) if
 
 The command asks three things:
 
-1. One admin password. Press Enter to keep the generated one. It is shared by Jellyfin, Seerr (the request page), Sonarr, Radarr, Prowlarr, and qBittorrent.
+1. One admin password. Press Enter to keep the generated one. It is shared by Jellyfin, Seerr, Sonarr, Radarr, Prowlarr, and qBittorrent.
 2. Whether downloads should go through a VPN. The guide uses [IVPN](https://www.ivpn.net/) over OpenVPN. Gluetun cannot create that account for you. Paste the OpenVPN user and password from a provider Gluetun supports, or answer no and downloads use your normal network.
-3. How you want to open Jellyfin from outside the house. Press 4 to keep it on this computer for now. The choices are in step 5.
+3. How you want to open the player and the search page from outside the house. Press 4 to keep them on this computer for now. The choices are in step 4.
 
 To skip the questions:
 
@@ -38,16 +51,9 @@ VPN_TYPE=wireguard WIREGUARD_PRIVATE_KEY='...' WIREGUARD_ADDRESSES='10.x.x.x/32'
 
 Provider names and extra settings are in the [Gluetun wiki](https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers). An extra setting uses a `GLUETUN_` prefix, so `GLUETUN_SERVER_COUNTRIES=Netherlands` becomes `SERVER_COUNTRIES` in the container.
 
-When it finishes, it prints the password and saves it in `credentials.txt`. Open Jellyfin at http://127.0.0.1:8096 and sign in with that password.
+When it finishes, it prints the password and saves it in `credentials.txt`. Sign in with that password on every address in the table above. Start with Seerr at http://127.0.0.1:5055 if you want to request something, or Jellyfin at http://127.0.0.1:8096 if you only want to play what is already on disk.
 
-| App | Address | What it is for |
-| --- | --- | --- |
-| Jellyfin | http://127.0.0.1:8096 | Play movies and shows |
-| Seerr | http://127.0.0.1:5055 | Request a title |
-| Radarr | http://127.0.0.1:7878 | Movies |
-| Sonarr | http://127.0.0.1:8989 | TV series |
-| Prowlarr | http://127.0.0.1:9696 | Indexers |
-| qBittorrent | http://127.0.0.1:8080 | Downloads |
+Radarr is at http://127.0.0.1:7878, Sonarr at http://127.0.0.1:8989, Prowlarr at http://127.0.0.1:9696, and qBittorrent at http://127.0.0.1:8080.
 
 With the VPN on, qBittorrent, Prowlarr, and FlareSolverr leave through the VPN. Jellyfin, Seerr, Sonarr, and Radarr stay on your normal network.
 
@@ -72,11 +78,11 @@ You add the indexer once, in Prowlarr. Sonarr and Radarr receive it from there.
 
 ## 3. Request a movie and play it
 
-Sonarr is for series. A movie request goes to Radarr.
+The path is Seerr (search) → Radarr (movies) or Sonarr (series) → qBittorrent (the torrent) → Jellyfin (play).
 
-1. Open http://127.0.0.1:5055 and sign in with the same admin account.
+1. Open Seerr at http://127.0.0.1:5055 and sign in with the same admin account.
 2. Search for the movie, open the matching result, and click **Request**.
-3. Open http://127.0.0.1:7878. The movie is listed. With no file yet, Radarr marks it missing.
+3. Open Radarr at http://127.0.0.1:7878. The movie is listed. With no file yet, Radarr marks it missing.
 4. Open the movie and choose **Search**. qBittorrent downloads a release you have the right to store. Radarr files it into `media/movies`.
 5. In Jellyfin, open the Movies library and play it. If you copied the file in by hand, use the library menu and choose **Scan library**.
 
@@ -86,7 +92,7 @@ The short used as the example is the public-domain film *A Trip to the Moon* (19
 
 ## 4. Watch from another network
 
-Pick one. Jellyfin and the request page can leave the house. Sonarr, Radarr, Prowlarr, and qBittorrent stay on this computer.
+Pick one. Jellyfin and Seerr can leave the house. Sonarr, Radarr, Prowlarr, and qBittorrent stay on this computer.
 
 Running `./install.sh` in a terminal asks you to choose. `./install.sh --yes` stays on this computer until you pass `--remote`.
 
@@ -105,9 +111,9 @@ The domain must already be Active in the [Cloudflare dashboard](https://dash.clo
 CLOUDFLARE_API_TOKEN='paste-token' CLOUDFLARE_HOSTNAME='watch.example.com' ./install.sh --yes --remote cloudflare
 ```
 
-The command creates a tunnel named `jellyfin`, points `watch.example.com` at Jellyfin, and points `requests.example.com` at the request page. Open `https://watch.example.com`.
+The command creates a tunnel named `jellyfin`, points `watch.example.com` at Jellyfin, and points `requests.example.com` at Seerr. Open `https://watch.example.com`.
 
-`CLOUDFLARE_SEERR_HOSTNAME=off` keeps the request page on this computer. If you would rather attach the names in the dashboard, pass `CLOUDFLARE_TUNNEL_TOKEN` from the tunnel page. The service addresses to enter there are `http://jellyfin:8096` and `http://seerr:5055`.
+`CLOUDFLARE_SEERR_HOSTNAME=off` keeps Seerr on this computer. If you would rather attach the names in the dashboard, pass `CLOUDFLARE_TUNNEL_TOKEN` from the tunnel page. The service addresses to enter there are `http://jellyfin:8096` and `http://seerr:5055`.
 
 What the command does when Cloudflare is not ready yet:
 
@@ -127,7 +133,7 @@ Long videos can fail on a free Cloudflare plan. If playback stops, use port forw
 ./install.sh --yes --remote forward
 ```
 
-The command asks the router, over UPnP, to forward Jellyfin (`8096`) and the request page (`5055`) to this computer. From a phone that is not on the Wi-Fi, open the address it prints.
+The command asks the router, over UPnP, to forward Jellyfin (`8096`) and Seerr (`5055`) to this computer. From a phone that is not on the Wi-Fi, open the address it prints.
 
 If the router does not answer, the command prints the two TCP forwards to add by hand, the LAN address to aim them at, and this command if a firewall on the computer is blocking the ports:
 
