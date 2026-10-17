@@ -68,6 +68,7 @@ class AppState:
         self.seerr_external = ""
         self.library_syncs = 0
         self.calls = []
+        self.first_user_ready = False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -158,7 +159,12 @@ class Handler(BaseHTTPRequestHandler):
         app = self.app
         if path == "/System/Info/Public":
             return 200, {"StartupWizardCompleted": app.wizard}, "json"
+        if path == "/Startup/User" and method == "GET":
+            app.first_user_ready = True
+            return 200, {"Name": "jellyfin"}, "json"
         if path == "/Startup/User" and method == "POST":
+            if not app.first_user_ready:
+                return 404, {"title": "Not Found", "status": 404}, "json"
             app.user = body
             return 204, None, "empty"
         if path in {"/Startup/Configuration", "/Startup/RemoteAccess"} and method == "POST":

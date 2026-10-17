@@ -843,18 +843,7 @@ class StackConfigurator:
                 },
                 headers=startup_headers,
             )
-            try:
-                client.request(
-                    "POST",
-                    "/Startup/User",
-                    json_body={"Name": self.settings.admin_user, "Password": self.settings.admin_password},
-                    headers=startup_headers,
-                )
-            except SetupError as error:
-                # Jellyfin 12 rejects a second write once the admin password exists.
-                if "403" not in str(error) and "400" not in str(error):
-                    raise
-                self._jellyfin_token(client, auth_header)
+            self._create_jellyfin_admin(client, startup_headers, auth_header)
             self._add_jellyfin_libraries(client, auth_header, token=None)
             client.request(
                 "POST",
@@ -865,6 +854,40 @@ class StackConfigurator:
             client.request("POST", "/Startup/Complete", headers=startup_headers)
         token = self._jellyfin_token(client, auth_header)
         self._add_jellyfin_libraries(client, auth_header, token)
+
+    def _create_jellyfin_admin(self, client: ApiClient, startup_headers: dict[str, str], auth_header: str) -> None:
+        """Set the admin password.
+
+        Current Jellyfin creates the first user when GET /Startup/User runs.
+        POST /Startup/User returns 404 until that user exists, and 403 once a password is set.
+        """
+        body = {"Name": self.settings.admin_user, "Password": self.settings.admin_password}
+        self._read_jellyfin_first_user(client, startup_headers)
+        try:
+            client.request("POST", "/Startup/User", json_body=body, headers=startup_headers)
+            return
+        except SetupError as error:
+            if "404" not in str(error):
+                if "403" in str(error) or "400" in str(error):
+                    self._jellyfin_token(client, auth_header)
+                    return
+                raise
+        self._read_jellyfin_first_user(client, startup_headers)
+        try:
+            client.request("POST", "/Startup/User", json_body=body, headers=startup_headers)
+        except SetupError as error:
+            if "403" in str(error) or "400" in str(error):
+                self._jellyfin_token(client, auth_header)
+                return
+            raise
+
+    def _read_jellyfin_first_user(self, client: ApiClient, startup_headers: dict[str, str]) -> None:
+        try:
+            client.request("GET", "/Startup/User", headers=startup_headers)
+        except SetupError as error:
+            # Older servers create the user on POST and have no GET.
+            if "404" not in str(error):
+                raise
 
     def _jellyfin_token(self, client: ApiClient, auth_header: str) -> str:
         _, auth = client.request(
@@ -2238,7 +2261,7 @@ def choose_remote_access(settings: Settings, existing: Mapping[str, str], assume
                 "  ./install.sh --remote local"
             )
         settings.remote_access = mode
-    elif "REMOTE_ACCESS" not in existing and not assume_yes and sys.stdin.isatty():
+    elif "REMOTE_ACCESS" not in existing and not assume_yes and can_prompt():
         print()
         print("Reach Jellyfin from outside this computer:")
         print("  1  Cloudflare Tunnel (no router changes; the domain must already be on Cloudflare)")
@@ -2264,7 +2287,7 @@ def choose_remote_access(settings: Settings, existing: Mapping[str, str], assume
     settings.cloudflare_tunnel_token = settings.cloudflare_tunnel_token.strip()
     if settings.remote_access != "cloudflare":
         return
-    interactive = not assume_yes and sys.stdin.isatty()
+    interactive = not assume_yes and can_prompt()
     if interactive and not settings.cloudflare_hostname:
         settings.cloudflare_hostname = prompt("Jellyfin hostname (watch.example.com)", "")
     if interactive and not settings.cloudflare_api_token and not settings.cloudflare_tunnel_token:
