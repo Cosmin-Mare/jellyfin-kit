@@ -1,25 +1,43 @@
-# Search, download, and play, one command
+# Your own movie and TV library, one command
 
-One command installs the whole server and signs in to every part of it. Jellyfin is the player. The rest is what finds a title, grabs the torrent, and files it into the library:
+This sets up a private streaming library on a computer you control. You type the name of a movie or a show, click Request, and the computer downloads it and files it. You then press play in a browser, or in a TV app, the way you would on a streaming service. The files stay on your machine.
 
-| Piece | App | What you use it for |
+You do not sign up for a website. One command installs the programs that do each job, creates one login for all of them, and connects them. When it finishes, it prints that username and password and saves them in a file called `credentials.txt`.
+
+Here is the path, in the order you will use it:
+
+1. **Search.** You look up a title and request it.
+2. **Fetch.** The computer finds a copy and downloads it.
+3. **File.** A movie goes into the movie shelf. A series goes into the TV shelf.
+4. **Play.** You watch it.
+
+Those jobs have program names. You will see the names in the browser. You do not need to learn them first.
+
+| What you are doing | Program | Where it opens |
 | --- | --- | --- |
-| Player | Jellyfin | Watch movies and shows at http://127.0.0.1:8096 |
-| Library search | Seerr | Search and request a movie or series at http://127.0.0.1:5055 |
-| Movies | Radarr | Takes a movie request, searches, and files it into `media/movies` |
-| TV | Sonarr | Same path for series, filed into `media/tv` |
-| Indexers | Prowlarr | Where the search looks. You add your indexer account here once |
-| Torrent client | qBittorrent | Downloads the release Radarr or Sonarr picked |
-| Indexer helper | FlareSolverr | Lets Prowlarr reach indexers that require a browser check |
-| VPN | Gluetun | Optional. Puts the torrent client and Prowlarr on a VPN you already have |
+| Watch | Jellyfin | http://127.0.0.1:8096 |
+| Search and request | Seerr | http://127.0.0.1:5055 |
+| Keep the movie shelf | Radarr | http://127.0.0.1:7878 |
+| Keep the TV shelf | Sonarr | http://127.0.0.1:8989 |
+| Tell the search where to look | Prowlarr | http://127.0.0.1:9696 |
+| Download the file | qBittorrent | http://127.0.0.1:8080 |
 
-The same username and password work on all of them. It is printed at the end and saved in `credentials.txt`.
+`127.0.0.1` means "this computer." Open those addresses in a web browser on the machine that ran the command.
 
-This follows [Bryce Hoehn's automated Jellyfin guide](https://github.com/bryce-hoehn/automated-jellyfin-guide) (mirror of [the Codeberg original](https://codeberg.org/bhoehn/automated-jellyfin-guide)). That guide has you create each account in a browser. Here the command does that.
+Two smaller programs stay in the background. FlareSolverr helps the search get past sites that demand a real browser. Gluetun is optional: it sends the downloads through a VPN account you already have.
+
+The command can install everything except two things it cannot invent for you:
+
+- A **search source**. Prowlarr is empty until you paste the address and key from an indexer account you already use. That account is what knows where copies of a title are listed. You add it once. After that, Request can search.
+- A **VPN**, and only if you want downloads to leave through one. If you do not have one, answer no. Downloads then use your normal internet connection.
+
+Only download a title you have the right to store.
+
+This follows [Bryce Hoehn's automated Jellyfin guide](https://github.com/bryce-hoehn/automated-jellyfin-guide) (mirror of [the Codeberg original](https://codeberg.org/bhoehn/automated-jellyfin-guide)). That guide asks you to create each account by hand in a browser. Here the command does that.
 
 ## 1. Start the server
 
-On Linux, this installs Docker and Python 3 when they are missing. On macOS or Windows, install [Docker Desktop](https://docs.docker.com/desktop/), start it, then run the same command.
+You need a computer that can stay on, such as a home PC or a small Linux machine. On Linux, the command also installs Docker and Python 3 if they are missing. Docker is the box these programs run in. You do not have to learn it. On a Mac or a Windows PC, install [Docker Desktop](https://docs.docker.com/desktop/) and start it, then run the same command.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/install.sh | bash
@@ -27,11 +45,11 @@ curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/insta
 
 The files land in `~/jellyfin-kit`. Your movies, config, and password stay there if you run it again.
 
-The command asks three things:
+The command asks three things. Press Enter whenever you want to keep what it suggests.
 
-1. One admin password. Press Enter to keep the generated one. It is shared by Jellyfin, Seerr, Sonarr, Radarr, Prowlarr, and qBittorrent.
-2. Whether downloads should go through a VPN. The guide uses [IVPN](https://www.ivpn.net/) over OpenVPN. Gluetun cannot create that account for you. Paste the OpenVPN user and password from a provider Gluetun supports, or answer no and downloads use your normal network.
-3. How you want to open the player and the search page from outside the house. Press 4 to keep them on this computer for now. The choices are in step 4.
+1. **A password.** One login for the player, the search page, the shelves, and the downloader. Press Enter to keep the password it made up.
+2. **A VPN, if you want one.** This hides download traffic behind a VPN company you already pay. The usual example is [IVPN](https://www.ivpn.net/). Paste that login, or answer **n**. Answering **n** is fine. Downloads then use your normal connection.
+3. **Watching from outside the house.** Press **4** to keep it on this computer for now. Step 4 explains the other choices.
 
 If Docker, Python, or any of the apps are already installed, the command says so. When an app's config is already there, it asks before repairing it, and it still installs whatever is missing. Press Enter to allow the repair. `./install.sh --yes` allows it without asking.
 
@@ -70,9 +88,9 @@ If the command stops early, read the message and run the command it prints. Two 
 - The VPN login is missing. Pass `OPENVPN_USER` and `OPENVPN_PASSWORD`, or rerun with `--no-vpn`.
 - Docker could not start. On Linux, run `sudo systemctl start docker` and rerun the curl command. On macOS or Windows, open Docker Desktop and rerun it.
 
-## 2. Add an indexer
+## 2. Tell it where to search
 
-Prowlarr is empty until you connect an indexer account you already have. Sonarr and Radarr then search through it.
+The search page cannot invent a catalog of files. You connect one indexer: an account you already have on a site that lists available copies. You do this once, in Prowlarr. The movie shelf and the TV shelf then search through it.
 
 1. Open http://127.0.0.1:9696 and sign in with the password from `credentials.txt`.
 2. Open **Indexers → Add Indexer** and choose **Torznab**.
@@ -86,7 +104,9 @@ You add the indexer once, in Prowlarr. Sonarr and Radarr receive it from there.
 
 ## 3. Request a movie and play it
 
-The path is Seerr (search) → Radarr (movies) or Sonarr (series) → qBittorrent (the torrent) → Jellyfin (play).
+This is the whole point of the setup. You search, you request, the computer downloads, you watch.
+
+Open Seerr, the search page. A movie request is handed to Radarr, the movie shelf, which sends the download to qBittorrent. A series request is handed to Sonarr, the TV shelf, and the episodes land in the TV library. Jellyfin is where you press play.
 
 1. Open Seerr at http://127.0.0.1:5055 and sign in with the same admin account.
 2. Search for the movie, open the matching result, and click **Request**.
@@ -100,7 +120,7 @@ The short used as the example is the public-domain film *A Trip to the Moon* (19
 
 ## 4. Watch from another network
 
-Pick one. Jellyfin and Seerr can leave the house. Sonarr, Radarr, Prowlarr, and qBittorrent stay on this computer.
+So far, the library only opens on the computer that runs it. This step lets you open the player and the search page from a phone or a laptop somewhere else. The shelves and the downloader stay on the home computer. You do not need this on the first day. Pick one of the three ways when you do.
 
 Running `./install.sh` in a terminal asks you to choose. `./install.sh --yes` stays on this computer until you pass `--remote`.
 
@@ -170,7 +190,9 @@ If the link expired, run `sudo tailscale up`, open the new link, and rerun the i
 
 ## 5. Day to day
 
-Put files you already have in `media/movies` and `media/tv`, then scan the library in Jellyfin. New downloads land in `downloads/completed`. Sonarr and Radarr move them into the libraries.
+After the first request works, daily use is the search page and the player. Open Seerr, request a title, and later open Jellyfin to watch it.
+
+Movies you already own can be copied into the `media/movies` folder, and shows into `media/tv`. In Jellyfin, open that library's menu and choose **Scan library** so they appear. New downloads arrive in `downloads/completed`, then the movie shelf or the TV shelf moves them into those folders for you.
 
 Run the curl command again, or `./install.sh` from `~/jellyfin-kit`, to repair the links. It keeps the password already in `.env` and asks before changing a config that is already there. `./install.sh --configure-only` skips Docker and only redoes the accounts.
 
