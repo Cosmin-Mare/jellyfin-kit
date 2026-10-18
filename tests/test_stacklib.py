@@ -390,6 +390,21 @@ def field_value(payload, name):
 
 
 class StacklibTests(unittest.TestCase):
+    def test_short_password_is_rejected(self):
+        self.assertIn("6", stacklib.password_problem("1234"))
+        self.assertEqual(stacklib.password_problem("123456"), "")
+        self._cleared_settings_env()
+        os.environ["ADMIN_PASSWORD"] = "1234"
+        os.environ["USE_VPN"] = "0"
+        self.addCleanup(lambda: os.environ.pop("ADMIN_PASSWORD", None))
+        self.addCleanup(lambda: os.environ.pop("USE_VPN", None))
+        with TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(stacklib, "ENV_PATH", Path(tmp) / ".env"):
+                with self.assertRaises(stacklib.SetupError) as raised:
+                    stacklib.collect_settings(assume_yes=True, no_vpn=True)
+        self.assertIn("6", str(raised.exception))
+        self.assertIn("ADMIN_PASSWORD", str(raised.exception))
+
     def test_password_hash_matches_qbittorrent_pbkdf2(self):
         secret = stacklib.qbittorrent_password_secret("correct horse")
         salt_b64, digest_b64 = secret.split(":")
@@ -453,9 +468,12 @@ class StacklibTests(unittest.TestCase):
             self.assertIn("WebUI\\HostHeaderValidation=false", text)
             secret = text.split('WebUI\\Password_PBKDF2="@ByteArray(', 1)[1].split(")", 1)[0]
             self.assertTrue(stacklib.verify_qbittorrent_secret(secret, "correct horse"))
-            stacklib.write_qbittorrent_conf(Path(tmp), "other", "nope", False)
+            stacklib.write_qbittorrent_conf(Path(tmp), "other", "longer-password", False)
             again = (Path(tmp) / "qbittorrent" / "qBittorrent" / "qBittorrent.conf").read_text()
-            self.assertEqual(text, again)
+            self.assertIn("WebUI\\Username=other", again)
+            self.assertIn("Session\\Interface=tun0", again)
+            secret = again.split('WebUI\\Password_PBKDF2="@ByteArray(', 1)[1].split(")", 1)[0]
+            self.assertTrue(stacklib.verify_qbittorrent_secret(secret, "longer-password"))
 
     def test_missing_vpn_account_explains_the_one_command(self):
         keys = [item.name.upper() for item in fields(stacklib.Settings)]

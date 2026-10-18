@@ -162,9 +162,48 @@ def host_timezone() -> str:
     return "Etc/UTC"
 
 
+MIN_ADMIN_PASSWORD = 6
+
+
 def generate_password(length: int = 20) -> str:
     alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def password_problem(password: str) -> str:
+    """Empty when every app in the stack can accept this password."""
+    if len(password) < MIN_ADMIN_PASSWORD:
+        return (
+            f"That password is {len(password)} characters. "
+            "qBittorrent refuses a password shorter than 6, and the same password is used for every app."
+        )
+    return ""
+
+
+def prompt_admin_password(current: str, assume_yes: bool) -> str:
+    if current and not password_problem(current):
+        return current
+    if current and password_problem(current):
+        message = password_problem(current)
+        if assume_yes or not can_prompt():
+            raise SetupError(
+                message + "\n\nSet ADMIN_PASSWORD to at least 6 characters and rerun ./install.sh."
+            )
+        print(message)
+        print("Enter a new password of at least 6 characters. Press Enter to use a generated one.")
+    while True:
+        generated = generate_password()
+        chosen = prompt(
+            "Admin password (Jellyfin, Seerr, Sonarr, Radarr, Prowlarr, qBittorrent)",
+            generated,
+            secret=True,
+            assume_yes=assume_yes,
+        )
+        problem = password_problem(chosen)
+        if not problem:
+            return chosen
+        print(problem)
+        print("Try again, or press Enter to use a generated password.")
 
 
 def qbittorrent_password_secret(password: str) -> str:
@@ -475,6 +514,7 @@ def write_qbittorrent_conf(config_dir: Path, username: str, password: str, use_v
     conf_dir.mkdir(parents=True, exist_ok=True)
     conf_path = conf_dir / "qBittorrent.conf"
     if conf_path.exists():
+        refresh_qbittorrent_account(conf_path, username, password)
         return
     interface = ""
     if use_vpn:
@@ -511,6 +551,29 @@ WebUI\\UseUPnP=false
 WebUI\\Username={username}
 """
     conf_path.write_text(contents, encoding="utf-8")
+
+
+def refresh_qbittorrent_account(conf_path: Path, username: str, password: str) -> None:
+    """Update the WebUI login in an existing qBittorrent.conf and leave the other settings."""
+    text = conf_path.read_text(encoding="utf-8")
+    updated = _replace_conf_line(text, r"WebUI\Username", username)
+    updated = _replace_conf_line(updated, r"WebUI\Password_PBKDF2", qbittorrent_password_ini(password))
+    if updated != text:
+        conf_path.write_text(updated, encoding="utf-8")
+
+
+def _replace_conf_line(text: str, key: str, value: str) -> str:
+    prefix = key + "="
+    lines = text.splitlines()
+    found = False
+    for index, line in enumerate(lines):
+        if line.startswith(prefix):
+            lines[index] = prefix + value
+            found = True
+            break
+    if not found:
+        lines.append(prefix + value)
+    return "\n".join(lines) + "\n"
 
 
 def prepare_directories(settings: Settings) -> None:
@@ -955,10 +1018,19 @@ class StackConfigurator:
         client.headers["Referer"] = self.urls["qbit"] + "/"
         wait_until("qBittorrent", lambda: service_is_up(self.urls["qbit"] + "/api/v2/app/version"))
         if not self._qbit_login(client, self.settings.admin_password):
+            conf_path = self.config_dir / "qbittorrent" / "qBittorrent" / "qBittorrent.conf"
+            if conf_path.exists():
+                refresh_qbittorrent_account(conf_path, self.settings.admin_user, self.settings.admin_password)
+            if self.restarter:
+                self.log("qBittorrent still has the previous password. Restarting it with the current one...")
+                self.restarter("qbittorrent")
+                wait_until("qBittorrent", lambda: service_is_up(self.urls["qbit"] + "/api/v2/app/version"))
+        if not self._qbit_login(client, self.settings.admin_password):
             temporary = self._temporary_qbit_password()
             if not temporary or not self._qbit_login(client, temporary):
                 raise SetupError(
-                    "Could not sign in to qBittorrent with the generated account or the temporary password."
+                    "Could not sign in to qBittorrent with the admin password or the temporary password.\n\n"
+                    "Rerun ./install.sh and choose a new password when asked."
                 )
         preferences = {
             "save_path": "/downloads/completed",
@@ -976,12 +1048,20 @@ class StackConfigurator:
         if self.settings.vpn_enabled:
             preferences["current_network_interface"] = "tun0"
             preferences["current_interface_name"] = "tun0"
-        client.request(
-            "POST",
-            "/api/v2/app/setPreferences",
-            form={"json": json.dumps(preferences)},
-            expected=(200,),
-        )
+        try:
+            client.request(
+                "POST",
+                "/api/v2/app/setPreferences",
+                form={"json": json.dumps(preferences)},
+                expected=(200,),
+            )
+        except SetupError as error:
+            if "at least 6 characters" in str(error).lower():
+                raise SetupError(
+                    "qBittorrent refused the admin password because it is shorter than 6 characters.\n\n"
+                    "Rerun ./install.sh. It will ask for a new password before continuing."
+                ) from error
+            raise
         for category in (TV_CATEGORY, MOVIE_CATEGORY):
             try:
                 client.request(
@@ -2694,14 +2774,7 @@ def collect_settings(assume_yes: bool, no_vpn: bool, remote: str | None = None) 
     if "TZ" not in existing:
         settings.tz = host_timezone()
     settings.admin_user = prompt("Admin username", settings.admin_user or "admin", assume_yes=assume_yes)
-    if not settings.admin_password:
-        generated = generate_password()
-        settings.admin_password = prompt(
-            "Admin password (Jellyfin, Seerr, Sonarr, Radarr, Prowlarr, qBittorrent)",
-            generated,
-            secret=True,
-            assume_yes=assume_yes,
-        )
+    settings.admin_password = prompt_admin_password(settings.admin_password, assume_yes)
     settings.media_dir = prompt("Media directory", settings.media_dir, assume_yes=assume_yes)
     settings.download_dir = prompt("Download directory", settings.download_dir, assume_yes=assume_yes)
     settings.tz = prompt("Timezone", settings.tz, assume_yes=assume_yes)
@@ -2970,7 +3043,23 @@ def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | 
         restarter=lambda service: restart_service(service, settings.vpn_enabled),
     )
     if repair:
-        configurator.configure()
+        while True:
+            try:
+                configurator.configure()
+                break
+            except SetupError as error:
+                print(f"error: {error}", file=sys.stderr)
+                if assume_yes or not can_prompt():
+                    raise
+                print()
+                print("The accounts were not finished.")
+                if not confirm("Set a new admin password and try the account setup again", default=True):
+                    raise
+                settings.admin_password = prompt_admin_password("", assume_yes=False)
+                write_env_file(ENV_PATH, settings, extras)
+                conf_path = configurator.config_dir / "qbittorrent" / "qBittorrent" / "qBittorrent.conf"
+                if conf_path.exists():
+                    refresh_qbittorrent_account(conf_path, settings.admin_user, settings.admin_password)
     else:
         print("Left the existing app settings in place.")
         print("Answer yes to the check next time when you want those accounts linked.")

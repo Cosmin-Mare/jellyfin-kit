@@ -69,7 +69,7 @@ The files land in `~/jellyfin-kit`. Your movies, config, and password stay there
 
 The command asks three things. Press Enter whenever you want to keep what it suggests.
 
-1. **A password.** One login for the player, the search page, the shelves, and the downloader. Press Enter to keep the password it made up.
+1. **A password.** One login for the player, the search page, the shelves, and the downloader. It must be at least 6 characters, because qBittorrent refuses anything shorter. Press Enter to keep the password it made up. If a saved password is too short, the command says so and asks for a new one. If account setup then fails, it offers to set a new password and try that step again.
 2. **A VPN, if you want one.** This hides download traffic behind a VPN company you already pay. The usual example is [IVPN](https://www.ivpn.net/). Paste that login, or answer **n**. Answering **n** is fine. Downloads then use your normal connection.
 3. **Where you watch.** **1** is this Wi-Fi. **2** is away from home, and then you pick Cloudflare, the router, or Tailscale. Press Enter for at home. The section above explains each one.
 
