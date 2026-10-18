@@ -1404,10 +1404,6 @@ REMOTE_MODES = {"local", "cloudflare", "forward"}
 
 def normalize_remote_mode(value: str) -> str | None:
     aliases = {
-        "1": "cloudflare",
-        "2": "forward",
-        "3": "tailscale",
-        "4": "local",
         "tunnel": "cloudflare",
         "cloudflare": "cloudflare",
         "cf": "cloudflare",
@@ -1418,6 +1414,10 @@ def normalize_remote_mode(value: str) -> str | None:
         "upnp": "forward",
         "tailscale": "tailscale",
         "tailnet": "tailscale",
+        "lan": "lan",
+        "home": "lan",
+        "wifi": "lan",
+        "wi-fi": "lan",
         "local": "local",
         "none": "local",
         "off": "local",
@@ -2024,6 +2024,33 @@ def try_upnp_forward(
     return parse_upnp_value(ip_xml, "NewExternalIPAddress"), ""
 
 
+def setup_lan(settings: Settings, address: str | None = None) -> str:
+    """Publish the player and the search page to other devices on this Wi-Fi."""
+    host = lan_address() if address is None else address
+    if not host:
+        return (
+            "This computer is set for the home network, and its address could not be detected.\n\n"
+            "On a phone or TV on the same Wi-Fi, open http://THIS-ADDRESS:"
+            f"{settings.jellyfin_port}\n"
+            "Find THIS-ADDRESS with: ip -4 addr\n"
+            "It usually starts with 192.168.\n\n"
+            "A phone on mobile data cannot open that address. "
+            "To watch away from home, rerun the installer and choose away from home."
+        )
+    settings.public_jellyfin_url = f"http://{host}:{settings.jellyfin_port}"
+    settings.public_seerr_url = f"http://{host}:{settings.seerr_port}"
+    return (
+        f"On the same Wi-Fi, open {settings.public_jellyfin_url} to watch.\n"
+        f"The search page is {settings.public_seerr_url}\n"
+        "Use the same username and password. Nothing was opened to the internet.\n"
+        "A phone on mobile data cannot open these addresses.\n"
+        "If a device on this Wi-Fi still cannot connect, a firewall on this computer may be blocking it. Run:\n"
+        f"  sudo ufw allow from 192.168.0.0/16 to any port {settings.jellyfin_port} proto tcp\n"
+        f"  sudo ufw allow from 192.168.0.0/16 to any port {settings.seerr_port} proto tcp\n"
+        "To watch away from home, rerun the installer and choose away from home."
+    )
+
+
 def forward_ports(
     settings: Settings,
     *,
@@ -2249,37 +2276,94 @@ def setup_tailscale(settings: Settings) -> str:
     return describe_tailscale(settings, payload, auth_url)
 
 
+def home_or_away_choice(typed: str) -> str | None:
+    """Return lan, away, or a finished mode such as tailscale."""
+    key = typed.strip().lower()
+    if key in {"1", "lan", "home", "wifi", "wi-fi"}:
+        return "lan"
+    if key in {"2", "away", "remote", "outside"}:
+        return "away"
+    return normalize_remote_mode(key)
+
+
+def remote_method_choice(typed: str) -> str | None:
+    key = typed.strip().lower()
+    numbered = {"1": "cloudflare", "2": "forward", "3": "tailscale"}
+    if key in numbered:
+        return numbered[key]
+    mode = normalize_remote_mode(key)
+    if mode in {"cloudflare", "forward", "tailscale"}:
+        return mode
+    return None
+
+
+def ask_where_to_watch(current: str) -> str:
+    print()
+    print("Where do you want to watch?")
+    print()
+    print("  1  At home, on this Wi-Fi")
+    print("     Phones, computers, and TVs on the same network open the player.")
+    print("     The address looks like http://192.168.1.20:8096")
+    print("     Nothing is opened to the internet.")
+    print()
+    print("  2  Away from home as well")
+    print("     A phone on mobile data, or a computer somewhere else, can open it.")
+    print("     The next question is how. The shelves and the downloader stay here.")
+    print()
+    default = "2" if current in {"cloudflare", "forward", "tailscale"} else "1"
+    picked = home_or_away_choice(prompt("Choice", default))
+    if picked is None:
+        raise SetupError("Type 1 for at home, or 2 for away from home. Then rerun ./install.sh.")
+    if picked != "away":
+        return picked
+    print()
+    print("How should it be reached from outside?")
+    print()
+    print("  1  Cloudflare Tunnel")
+    print("     You already have a domain on Cloudflare. No change on the router.")
+    print("     You get an address like https://watch.example.com")
+    print("     Long movies can fail on a free Cloudflare plan.")
+    print()
+    print("  2  Open a port on the router")
+    print("     The installer asks the router to let the internet through.")
+    print("     You get an address like http://203.0.113.8:8096")
+    print("     If the router refuses, the command prints the two ports to add by hand.")
+    print()
+    print("  3  Tailscale")
+    print("     No domain and no open port. A free account is enough.")
+    print("     Install the Tailscale app here and on the phone, with the same login.")
+    print("     You get an address like http://100.x.x.x:8096")
+    print()
+    method_default = {"cloudflare": "1", "forward": "2"}.get(current, "3")
+    method = remote_method_choice(prompt("Choice", method_default))
+    if method is None:
+        raise SetupError("Type 1 for Cloudflare, 2 for the router, or 3 for Tailscale. Then rerun ./install.sh.")
+    return method
+
+
 def choose_remote_access(settings: Settings, existing: Mapping[str, str], assume_yes: bool, remote: str | None) -> None:
     if remote:
         mode = normalize_remote_mode(remote)
         if mode is None:
             raise SetupError(
-                f"Unknown remote access {remote!r}. Use cloudflare, forward, tailscale, or local.\n\n"
+                f"Unknown remote access {remote!r}. Use lan, cloudflare, forward, tailscale, or local.\n\n"
+                "  ./install.sh --remote lan\n"
                 "  ./install.sh --remote cloudflare\n"
                 "  ./install.sh --remote forward\n"
                 "  ./install.sh --remote tailscale\n"
                 "  ./install.sh --remote local"
             )
         settings.remote_access = mode
-    elif "REMOTE_ACCESS" not in existing and not assume_yes and can_prompt():
-        print()
-        print("Reach Jellyfin from outside this computer:")
-        print("  1  Cloudflare Tunnel (no router changes; the domain must already be on Cloudflare)")
-        print("  2  Port forwarding (open Jellyfin on your router)")
-        print("  3  Tailscale (no domain and no router changes)")
-        print("  4  This computer only")
-        mode = normalize_remote_mode(prompt("Choice", "4"))
-        if mode is None:
-            raise SetupError("Type 1, 2, 3, or 4. Then rerun ./install.sh.")
-        settings.remote_access = mode
+    elif not assume_yes and can_prompt():
+        settings.remote_access = ask_where_to_watch(settings.remote_access or "lan")
     elif "REMOTE_ACCESS" not in existing:
         settings.remote_access = "local"
     else:
         mode = normalize_remote_mode(settings.remote_access)
         if mode is None:
             raise SetupError(
-                f"REMOTE_ACCESS={settings.remote_access!r} is not local, cloudflare, forward, or tailscale.\n\n"
-                "Edit .env or rerun with --remote cloudflare, --remote forward, --remote tailscale, or --remote local."
+                f"REMOTE_ACCESS={settings.remote_access!r} is not lan, local, cloudflare, forward, or tailscale.\n\n"
+                "Edit .env or rerun with --remote lan, --remote cloudflare, --remote forward, --remote tailscale, or --remote local."
             )
         settings.remote_access = mode
 
@@ -2467,7 +2551,10 @@ def write_credentials(settings: Settings, api_keys: Mapping[str, str], remote_no
     lines.append("Add indexers you subscribe to in Prowlarr. They sync to Sonarr and Radarr.")
     lines.append("")
     if settings.public_jellyfin_url or settings.public_seerr_url or remote_note.strip():
-        lines.append("Away from this computer")
+        if settings.remote_access == "lan":
+            lines.append("On your home Wi-Fi")
+        else:
+            lines.append("Away from this computer")
         if settings.public_jellyfin_url:
             lines.append(f"Jellyfin     {settings.public_jellyfin_url}")
         if settings.public_seerr_url:
@@ -2611,6 +2698,10 @@ def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | 
         print("Connecting Tailscale...")
         remote_note = setup_tailscale(settings)
         write_env_file(ENV_PATH, settings, extras)
+    elif settings.remote_access == "lan":
+        print("Opening Jellyfin and Seerr on the home network...")
+        remote_note = setup_lan(settings)
+        write_env_file(ENV_PATH, settings, extras)
     if repair and (settings.public_jellyfin_url or settings.public_seerr_url):
         try:
             configurator.publish_remote_urls()
@@ -2648,7 +2739,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-vpn", action="store_true", help="Do not route downloads through Gluetun.")
     parser.add_argument(
         "--remote",
-        help="Reach Jellyfin from outside this computer: cloudflare, forward, tailscale, or local.",
+        help="Where to watch: lan (this Wi-Fi), cloudflare, forward, tailscale, or local. Asked when omitted.",
     )
     parser.add_argument("--configure-only", action="store_true", help="Skip docker compose and only configure running apps.")
     parser.add_argument("--render-only", action="store_true", help="Write compose files and exit.")

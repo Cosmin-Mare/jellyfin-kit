@@ -35,6 +35,28 @@ Only download a title you have the right to store.
 
 This follows [Bryce Hoehn's automated Jellyfin guide](https://github.com/bryce-hoehn/automated-jellyfin-guide) (mirror of [the Codeberg original](https://codeberg.org/bhoehn/automated-jellyfin-guide)). That guide asks you to create each account by hand in a browser. Here the command does that.
 
+## Watching at home or away
+
+The player starts on the computer that ran the command. The install then asks where else you want to watch. Press Enter to keep the suggested answer. Skip this only when you pass `--remote` yourself, or when you pass `--yes`, which stays on this computer until you choose.
+
+**1. At home, on this Wi-Fi.** Phones, laptops, and TVs on the same network open the player. The address looks like `http://192.168.1.20:8096`. The search page is the same address with port `5055`. Nothing is opened to the internet. A phone on mobile data cannot use that address. To choose this without the question:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/install.sh | bash -s -- --remote lan
+```
+
+**2. Away from home as well.** A phone on mobile data, or a computer somewhere else, can open the player and the search page. The movie shelf, the TV shelf, and the downloader stay on the home computer. The installer then asks how:
+
+| Choice | Pick it when | What you get | If it cannot finish |
+| --- | --- | --- | --- |
+| Cloudflare Tunnel | You already have a domain on Cloudflare | `https://watch.example.com` | The command names the missing token, domain, or DNS record, and the page to open |
+| Open a port on the router | You can change the router, or it allows it automatically | `http://your-public-address:8096` | It prints the two ports to add by hand. If the router only has a carrier address, it sends you to Tailscale |
+| Tailscale | You have no domain and cannot open a port | `http://100.x.x.x:8096` after the same login on both devices | It prints the sign-in link, or the install command, and you rerun |
+
+Long movies can fail on a free Cloudflare plan. If playback stops, run the installer again and pick the router or Tailscale.
+
+The shelves and the downloader are not opened to the internet in any of these choices.
+
 ## 1. Start the server
 
 You need a computer that can stay on, such as a home PC or a small Linux machine. On Linux, the command also installs Docker and Python 3 if they are missing. Docker is the box these programs run in. You do not have to learn it. On a Mac or a Windows PC, install [Docker Desktop](https://docs.docker.com/desktop/) and start it, then run the same command.
@@ -49,7 +71,7 @@ The command asks three things. Press Enter whenever you want to keep what it sug
 
 1. **A password.** One login for the player, the search page, the shelves, and the downloader. Press Enter to keep the password it made up.
 2. **A VPN, if you want one.** This hides download traffic behind a VPN company you already pay. The usual example is [IVPN](https://www.ivpn.net/). Paste that login, or answer **n**. Answering **n** is fine. Downloads then use your normal connection.
-3. **Watching from outside the house.** Press **4** to keep it on this computer for now. Step 4 explains the other choices.
+3. **Where you watch.** **1** is this Wi-Fi. **2** is away from home, and then you pick Cloudflare, the router, or Tailscale. Press Enter for at home. The section above explains each one.
 
 If Docker, Python, or any of the apps are already installed, the command says so. When an app's config is already there, it asks before repairing it, and it still installs whatever is missing. Press Enter to allow the repair. `./install.sh --yes` allows it without asking.
 
@@ -118,11 +140,13 @@ A series uses the same search in Seerr. Requesting it sends the show to Sonarr, 
 
 The short used as the example is the public-domain film *A Trip to the Moon* (1902). A copy can come from the Internet Archive. After your Torznab account is saved, the same Request button is what you use for everything else.
 
-## 4. Watch from another network
+## 4. Open it on a phone
 
-So far, the library only opens on the computer that runs it. This step lets you open the player and the search page from a phone or a laptop somewhere else. The shelves and the downloader stay on the home computer. You do not need this on the first day. Pick one of the three ways when you do.
+Use the address printed at the end of the install. It is also in `credentials.txt`.
 
-Running `./install.sh` in a terminal asks you to choose. `./install.sh --yes` stays on this computer until you pass `--remote`.
+At home, that address starts with `192.168`. Open it from a phone on the same Wi-Fi. Away from home, use the Cloudflare name, the public address, or the Tailscale address from the choice you made. The explanation of each choice is in **Watching at home or away** at the top.
+
+To change your mind later, run the same install command again and answer the question, or pass one flag: `--remote lan`, `--remote cloudflare`, `--remote forward`, or `--remote tailscale`. `--yes` by itself does not ask, and leaves watching on this computer.
 
 ### You have a domain on Cloudflare
 
@@ -196,7 +220,21 @@ Movies you already own can be copied into the `media/movies` folder, and shows i
 
 Run the curl command again, or `./install.sh` from `~/jellyfin-kit`, to repair the links. It keeps the password already in `.env` and asks before changing a config that is already there. `./install.sh --configure-only` skips Docker and only redoes the accounts.
 
-Stop the stack from this directory:
+To remove the library, run:
+
+```bash
+bash ~/jellyfin-kit/uninstall.sh
+```
+
+It stops the player, the search page, the shelves, and the downloader, and deletes their settings and half-finished downloads. It asks before deleting the movies and shows in `media/`. It also asks before uninstalling Docker or Tailscale, because other programs on the computer may be using them.
+
+```bash
+bash ~/jellyfin-kit/uninstall.sh --yes --media
+```
+
+That line also deletes `media/`. Add `--docker` or `--tailscale` only when you want those removed from the whole computer.
+
+Stop the programs and leave the files in place with:
 
 ```bash
 docker compose down

@@ -625,8 +625,34 @@ class StacklibTests(unittest.TestCase):
             with unittest.mock.patch.object(stacklib, "ENV_PATH", Path(tmp) / ".env"):
                 with self.assertRaises(stacklib.SetupError) as raised:
                     stacklib.collect_settings(assume_yes=True, no_vpn=True, remote="magic")
+        self.assertIn("--remote lan", str(raised.exception))
         self.assertIn("--remote cloudflare", str(raised.exception))
         self.assertIn("--remote forward", str(raised.exception))
+
+    def test_watch_choices_split_home_and_away(self):
+        self.assertEqual(stacklib.home_or_away_choice("1"), "lan")
+        self.assertEqual(stacklib.home_or_away_choice("home"), "lan")
+        self.assertEqual(stacklib.home_or_away_choice("2"), "away")
+        self.assertEqual(stacklib.home_or_away_choice("tailscale"), "tailscale")
+        self.assertEqual(stacklib.remote_method_choice("1"), "cloudflare")
+        self.assertEqual(stacklib.remote_method_choice("2"), "forward")
+        self.assertEqual(stacklib.remote_method_choice("3"), "tailscale")
+        self.assertIsNone(stacklib.remote_method_choice("lan"))
+
+    def test_lan_flag_is_accepted_without_a_prompt(self):
+        self._cleared_settings_env()
+        with TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(stacklib, "ENV_PATH", Path(tmp) / ".env"):
+                settings, _extras = stacklib.collect_settings(assume_yes=True, no_vpn=True, remote="home")
+        self.assertEqual(settings.remote_access, "lan")
+
+    def test_lan_note_uses_the_home_address(self):
+        settings = stacklib.Settings(use_vpn="0", remote_access="lan")
+        note = stacklib.setup_lan(settings, address="192.168.1.20")
+        self.assertEqual(settings.public_jellyfin_url, "http://192.168.1.20:8096")
+        self.assertEqual(settings.public_seerr_url, "http://192.168.1.20:5055")
+        self.assertIn("same Wi-Fi", note)
+        self.assertIn("away from home", note)
 
     def test_hostname_accepts_a_pasted_url(self):
         self._cleared_settings_env()

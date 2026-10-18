@@ -66,9 +66,16 @@ one that pulls container images.
 
    The example film is the public-domain short A Trip to the Moon (1902).
 
-4. Watch from another network
-   Jellyfin and Seerr can leave the house. Sonarr, Radarr, Prowlarr,
-   and qBittorrent stay on this computer. Pick one.
+4. Where you watch
+   The install command asks this when you do not pass --remote.
+   --yes by itself stays on this computer and does not ask.
+
+   1  At home, on this Wi-Fi. Other devices on the same network open
+      http://192.168.x.x:8096. Nothing is opened to the internet.
+      Choose it with:  --remote lan
+
+   2  Away from home as well. Then pick one of the three ways below.
+      The shelves and the downloader stay on this computer.
 
    A domain already Active on Cloudflare:
 
