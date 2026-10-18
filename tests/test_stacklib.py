@@ -646,6 +646,38 @@ class StacklibTests(unittest.TestCase):
                 settings, _extras = stacklib.collect_settings(assume_yes=True, no_vpn=True, remote="home")
         self.assertEqual(settings.remote_access, "lan")
 
+    def test_route_and_address_parsers(self):
+        gateway, interface = stacklib.parse_default_route("default via 192.168.0.1 dev enp0s3 proto dhcp")
+        self.assertEqual(gateway, "192.168.0.1")
+        self.assertEqual(interface, "enp0s3")
+        address, prefix, mac = stacklib.parse_interface_address(
+            "    link/ether aa:bb:cc:dd:ee:ff brd ff:ff:ff:ff:ff:ff\n    inet 192.168.0.50/24 brd 192.168.0.255 scope global"
+        )
+        self.assertEqual(address, "192.168.0.50")
+        self.assertEqual(prefix, 24)
+        self.assertEqual(mac, "aa:bb:cc:dd:ee:ff")
+
+    def test_provider_steps_follow_the_recognized_router(self):
+        self.assertEqual(stacklib.match_network_provider("Digi Romania router login"), "digi")
+        self.assertEqual(stacklib.match_network_provider("Livebox Orange"), "orange")
+        self.assertEqual(stacklib.match_network_provider("TP-Link Archer"), "tplink")
+        self.assertEqual(stacklib.match_network_provider("unknown appliance"), "generic")
+        guide = stacklib.lan_access_guide(
+            stacklib.Settings(),
+            address="192.168.1.40",
+            gateway="192.168.1.1",
+            interface="eth0",
+            prefix=24,
+            mac="aa:bb:cc:dd:ee:ff",
+            provider="digi",
+            tool="netplan",
+        )
+        self.assertIn("http://192.168.1.40:8096", guide)
+        self.assertIn("http://192.168.1.40:5055", guide)
+        self.assertIn("Digi", guide)
+        self.assertIn("aa:bb:cc:dd:ee:ff", guide)
+        self.assertIn("netplan apply", guide)
+
     def test_lan_note_uses_the_home_address(self):
         settings = stacklib.Settings(use_vpn="0", remote_access="lan")
         note = stacklib.setup_lan(settings, address="192.168.1.20")

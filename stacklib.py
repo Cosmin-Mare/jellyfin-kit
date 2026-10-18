@@ -1885,17 +1885,301 @@ def discover_gateway_location(timeout: float = 3) -> str | None:
 
 
 def lan_address() -> str:
+    return read_lan_facts()[0]
+
+
+def parse_default_route(text: str) -> tuple[str, str]:
+    """Return (gateway, interface) from `ip route` or `ip -4 route` text."""
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0] == "default" and parts[1] == "via" and "dev" in parts:
+            return parts[2], parts[parts.index("dev") + 1]
+    return "", ""
+
+
+def parse_interface_address(text: str) -> tuple[str, int, str]:
+    """Return (address, prefix, mac) from `ip addr` text."""
+    address = ""
+    prefix = 24
+    mac = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("link/ether "):
+            mac = stripped.split()[1]
+        elif stripped.startswith("inet "):
+            token = stripped.split()[1]
+            if "/" in token:
+                ip_text, prefix_text = token.split("/", 1)
+                if not ip_text.startswith("127."):
+                    address = ip_text
+                    try:
+                        prefix = int(prefix_text)
+                    except ValueError:
+                        prefix = 24
+    return address, prefix, mac
+
+
+def _linux_lan_facts() -> tuple[str, str, str, int, str]:
+    """Return address, gateway, interface, prefix, mac. Empty strings when unknown."""
+    route = subprocess.run(["ip", "-4", "route", "show", "default"], check=False, capture_output=True, text=True)
+    gateway, interface = parse_default_route(route.stdout or "")
+    if not interface:
+        return "", gateway, "", 24, ""
+    addr = subprocess.run(["ip", "-4", "addr", "show", "dev", interface], check=False, capture_output=True, text=True)
+    link = subprocess.run(["ip", "link", "show", "dev", interface], check=False, capture_output=True, text=True)
+    address, prefix, mac = parse_interface_address((addr.stdout or "") + "\n" + (link.stdout or ""))
+    return address, gateway, interface, prefix, mac
+
+
+def read_lan_facts() -> tuple[str, str, str, int, str]:
+    """Best-effort LAN address, gateway, interface, prefix, and MAC."""
+    if shutil.which("ip"):
+        try:
+            address, gateway, interface, prefix, mac = _linux_lan_facts()
+        except OSError:
+            address, gateway, interface, prefix, mac = "", "", "", 24, ""
+        if address:
+            return address, gateway, interface, prefix, mac
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.connect(("1.1.1.1", 80))
         address = sock.getsockname()[0]
     except OSError:
-        return ""
+        address = ""
     finally:
         sock.close()
     if address.startswith("127."):
+        address = ""
+    return address, "", "", 24, ""
+
+
+def match_network_provider(text: str) -> str:
+    """Name the router or internet provider from a page title, banner, or model string."""
+    lowered = text.lower()
+    checks = (
+        ("digi", ("digi", "rcs-rds", "rcs & rds")),
+        ("orange", ("livebox", "orange romania", "orange")),
+        ("vodafone", ("vodafone", "easybox")),
+        ("telekom", ("telekom", "cosmote")),
+        ("fritz", ("fritz!box", "fritzbox", "avm gmbh")),
+        ("tplink", ("tp-link", "tplink", "archer")),
+        ("asus", ("asuswrt", "rt-ax", "rt-ac", "asus")),
+        ("netgear", ("netgear", "orbi")),
+        ("unifi", ("unifi", "ubiquiti")),
+        ("google", ("google wifi", "nest wifi")),
+        ("openwrt", ("openwrt", "luci")),
+        ("mikrotik", ("mikrotik", "routeros")),
+    )
+    for name, hints in checks:
+        if any(hint in lowered for hint in hints):
+            return name
+    return "generic"
+
+
+def router_banner(gateway: str) -> str:
+    if not gateway:
         return ""
-    return address
+    chunks = [gateway]
+    try:
+        _status, body = http_exchange(f"http://{gateway}/", timeout=3)
+    except SetupError:
+        body = ""
+    title = ""
+    match = re.search(r"<title[^>]*>(.*?)</title>", body, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        title = re.sub(r"\s+", " ", match.group(1)).strip()
+    chunks.append(title)
+    chunks.append(body[:2000])
+    return " ".join(chunks)
+
+
+def provider_static_steps(provider: str, ip: str, gateway: str, mac: str) -> list[str]:
+    reserve = f"Reserve this computer: MAC {mac or '(the MAC printed above)'}, address {ip}."
+    pages = {
+        "digi": [
+            f"Your router looks like a Digi router. Open http://{gateway} in a browser on this network.",
+            "Sign in with the password printed on the router sticker.",
+            "Open Network or LAN, then DHCP. Digi sometimes labels this DHCP Binding or Address Reservation.",
+            reserve,
+            "Save. The player keeps this address after the router restarts.",
+        ],
+        "orange": [
+            f"Your router looks like an Orange Livebox. Open http://{gateway} in a browser on this network.",
+            "Sign in with the password printed on the Livebox sticker.",
+            "Open Advanced setup (Configurare avansată), then Network, then DHCP.",
+            "Add an address reservation. " + reserve,
+            "Save. The player keeps this address after the router restarts.",
+        ],
+        "vodafone": [
+            f"Your router looks like a Vodafone station. Open http://{gateway} in a browser on this network.",
+            "Sign in with the password printed on the router sticker.",
+            "Open Home network or LAN, then DHCP, then Add reservation or Static lease.",
+            reserve,
+            "Save. The player keeps this address after the router restarts.",
+        ],
+        "telekom": [
+            f"Your router looks like a Telekom router. Open http://{gateway} in a browser on this network.",
+            "Sign in with the password printed on the router sticker.",
+            "Open Home network or LAN, then DHCP, then Address reservation.",
+            reserve,
+            "Save. The player keeps this address after the router restarts.",
+        ],
+        "fritz": [
+            f"Your router looks like a Fritz!Box. Open http://{gateway} or http://fritz.box .",
+            "Sign in with the Fritz!Box password.",
+            "Open Home Network, then Network. Click this computer in the list.",
+            "Turn on “Always assign this network device the same IPv4 address” and use " + ip + ".",
+            "Apply. The player keeps this address after the router restarts.",
+        ],
+        "tplink": [
+            f"Your router looks like a TP-Link. Open http://{gateway} or http://tplinkwifi.net .",
+            "Sign in with the router password.",
+            "Open Advanced, then Network, then DHCP Server, then Address Reservation, then Add.",
+            reserve,
+            "Save. The player keeps this address after the router restarts.",
+        ],
+        "asus": [
+            f"Your router looks like an Asus router. Open http://{gateway} or http://router.asus.com .",
+            "Sign in with the router password.",
+            "Open LAN, then DHCP Server. Under Manually Assigned IP, add this computer.",
+            reserve,
+            "Apply. The player keeps this address after the router restarts.",
+        ],
+        "netgear": [
+            f"Your router looks like a Netgear router. Open http://{gateway} or http://routerlogin.net .",
+            "Sign in with the router password.",
+            "Open Advanced, then Setup, then LAN Setup, then Address Reservation.",
+            reserve,
+            "Apply. The player keeps this address after the router restarts.",
+        ],
+        "unifi": [
+            "Your network looks like UniFi.",
+            "Open the UniFi Network app, then Client devices, then this computer.",
+            "Turn on Fixed IP and set " + ip + ".",
+            "Apply. The player keeps this address after the router restarts.",
+        ],
+        "google": [
+            "Your network looks like Google Wifi or Nest Wifi.",
+            "Open the Google Home app, then Wifi, then Settings, then Advanced networking, then DHCP IP reservations.",
+            "Add this computer and set " + ip + f". Its MAC address is {mac or 'printed above'}.",
+            "Save. The player keeps this address after the router restarts.",
+        ],
+        "openwrt": [
+            f"Your router looks like OpenWrt. Open http://{gateway} .",
+            "Sign in, then open Network, then DHCP and DNS, then Static Leases, then Add.",
+            reserve,
+            "Save and apply. The player keeps this address after the router restarts.",
+        ],
+        "mikrotik": [
+            f"Your router looks like a MikroTik. Open http://{gateway} .",
+            "Sign in, then open IP, then DHCP Server, then Leases.",
+            "Find this computer and choose Make Static. " + reserve,
+            "The player keeps this address after the router restarts.",
+        ],
+    }
+    if provider in pages:
+        return pages[provider]
+    return [
+        f"The router brand could not be recognized. Open http://{gateway} in a browser on this network.",
+        "Sign in with the password printed on the router sticker.",
+        "Find DHCP, LAN, or Address reservation. The name differs by brand.",
+        reserve,
+        "Save. The player keeps this address after the router restarts.",
+    ]
+
+
+def computer_static_steps(tool: str, interface: str, ip: str, prefix: int, gateway: str) -> list[str]:
+    dns = "1.1.1.1,8.8.8.8"
+    iface = interface or "eth0"
+    if tool == "nmcli":
+        return [
+            "If you cannot sign in to the router, set the address on this computer instead. It is using NetworkManager.",
+            "Find the connection name with: nmcli connection show --active",
+            "Then, using that name:",
+            f"  sudo nmcli connection modify \"CONNECTION-NAME\" ipv4.method manual ipv4.addresses {ip}/{prefix} ipv4.gateway {gateway or 'YOUR.ROUTER'} ipv4.dns \"{dns}\"",
+            "  sudo nmcli connection up \"CONNECTION-NAME\"",
+            "Skip this if you reserved the address in the router. Doing both can knock the computer off the network.",
+        ]
+    if tool == "netplan":
+        return [
+            "If you cannot sign in to the router, set the address on this computer instead. It is using netplan.",
+            f"Edit the yaml file in /etc/netplan/ so {iface} contains:",
+            "  dhcp4: false",
+            f"  addresses: [{ip}/{prefix}]",
+            "  routes:",
+            "    - to: default",
+            f"      via: {gateway or 'YOUR.ROUTER'}",
+            "  nameservers:",
+            f"    addresses: [{dns}]",
+            "Then run: sudo netplan apply",
+            "Skip this if you reserved the address in the router. Doing both can knock the computer off the network.",
+        ]
+    return [
+        "If you cannot sign in to the router, set the same address in this computer's network settings.",
+        f"Address {ip}/{prefix}, gateway {gateway or 'the router address above'}, DNS 1.1.1.1.",
+        "Skip that if you reserved the address in the router. Doing both can knock the computer off the network.",
+    ]
+
+
+def host_network_tool() -> str:
+    if shutil.which("nmcli") and Path("/etc/NetworkManager").exists():
+        return "nmcli"
+    if Path("/etc/netplan").is_dir() and any(Path("/etc/netplan").glob("*.yaml")):
+        return "netplan"
+    return "generic"
+
+
+def lan_access_guide(
+    settings: Settings,
+    *,
+    address: str,
+    gateway: str = "",
+    interface: str = "",
+    prefix: int = 24,
+    mac: str = "",
+    provider: str = "generic",
+    tool: str = "generic",
+) -> str:
+    watch = f"http://{address}:{settings.jellyfin_port}" if address else ""
+    search = f"http://{address}:{settings.seerr_port}" if address else ""
+    lines = ["Home network address", ""]
+    if not address:
+        lines.append("This computer's home-network address could not be detected.")
+        lines.append("On another device on the same Wi-Fi, you need the address from: ip -4 addr")
+        lines.append("It usually starts with 192.168. Open that address with :8096 to watch.")
+        return "\n".join(lines)
+    lines.append(f"Watch        {watch}")
+    lines.append(f"Search       {search}")
+    lines.append("Open those from a phone, computer, or TV on the same Wi-Fi.")
+    lines.append("Use the same username and password. A phone on mobile data cannot open them.")
+    lines.append("")
+    lines.append("The address can change when the router restarts. Reserve it so it stays.")
+    if mac:
+        lines.append(f"This computer's MAC address: {mac}")
+    if gateway:
+        lines.append(f"Router address: http://{gateway}")
+    lines.append("")
+    lines.extend(provider_static_steps(provider, address, gateway or "the router", mac))
+    lines.append("")
+    lines.extend(computer_static_steps(tool, interface, address, prefix, gateway))
+    return "\n".join(lines)
+
+
+def build_lan_access_guide(settings: Settings) -> str:
+    address, gateway, interface, prefix, mac = read_lan_facts()
+    provider = "generic"
+    if gateway:
+        provider = match_network_provider(router_banner(gateway))
+    return lan_access_guide(
+        settings,
+        address=address,
+        gateway=gateway,
+        interface=interface,
+        prefix=prefix,
+        mac=mac,
+        provider=provider,
+        tool=host_network_tool(),
+    )
 
 
 def is_public_ip(ip: str) -> bool:
@@ -2724,6 +3008,14 @@ def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | 
         print("Accounts were not created. Rerun the command and answer yes to the config check.")
         if remote_note.strip():
             print(remote_note.strip())
+    guide = build_lan_access_guide(settings)
+    print()
+    print(guide)
+    if CREDENTIALS_PATH.exists():
+        current = CREDENTIALS_PATH.read_text(encoding="utf-8")
+        if "Home network address" not in current:
+            CREDENTIALS_PATH.write_text(current.rstrip() + "\n\n" + guide + "\n", encoding="utf-8")
+            os.chmod(CREDENTIALS_PATH, 0o600)
     if cloudflare_error:
         raise SetupError(cloudflare_error)
     if use_tunnel:

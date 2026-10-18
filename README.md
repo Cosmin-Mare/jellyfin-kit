@@ -39,7 +39,7 @@ This follows [Bryce Hoehn's automated Jellyfin guide](https://github.com/bryce-h
 
 The player starts on the computer that ran the command. The install then asks where else you want to watch. Press Enter to keep the suggested answer. Skip this only when you pass `--remote` yourself, or when you pass `--yes`, which stays on this computer until you choose.
 
-**1. At home, on this Wi-Fi.** Phones, laptops, and TVs on the same network open the player. The address looks like `http://192.168.1.20:8096`. The search page is the same address with port `5055`. Nothing is opened to the internet. A phone on mobile data cannot use that address. To choose this without the question:
+**1. At home, on this Wi-Fi.** Phones, laptops, and TVs on the same network open the player. When the install finishes, it prints that address, usually starting with `192.168`, and the steps to keep it from changing. Those steps follow the router it recognizes, such as Digi, Orange, Vodafone, TP-Link, or Asus. Nothing is opened to the internet. A phone on mobile data cannot use that address. To choose this without the question:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/install.sh | bash -s -- --remote lan
