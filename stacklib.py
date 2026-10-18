@@ -2209,6 +2209,35 @@ def host_network_tool() -> str:
     return "generic"
 
 
+def web_ui_pages(settings: Settings) -> list[tuple[str, str]]:
+    """Browser pages for this stack, in the order a person uses them."""
+    return [
+        ("Watch", settings.jellyfin_port),
+        ("Search", settings.seerr_port),
+        ("Movies", settings.radarr_port),
+        ("TV", settings.sonarr_port),
+        ("Indexers", settings.prowlarr_port),
+        ("Downloads", settings.qbit_port),
+    ]
+
+
+def lan_page_lines(address: str, settings: Settings) -> list[str]:
+    return [f"{label:<16} http://{address}:{port}" for label, port in web_ui_pages(settings)]
+
+
+def lan_firewall_block(settings: Settings) -> str:
+    ports = " ".join(port for _label, port in web_ui_pages(settings))
+    return (
+        "If a device on this Wi-Fi cannot open a page, this computer's firewall may be blocking it. Run:\n"
+        f"  for port in {ports}; do\n"
+        '    sudo ufw allow from 192.168.0.0/16 to any port "$port" proto tcp\n'
+        '    sudo ufw allow from 10.0.0.0/8 to any port "$port" proto tcp\n'
+        '    sudo ufw allow from 172.16.0.0/12 to any port "$port" proto tcp\n'
+        "  done\n"
+        "That opens every page to the home network. It does not open them to the internet."
+    )
+
+
 def lan_access_guide(
     settings: Settings,
     *,
@@ -2220,17 +2249,16 @@ def lan_access_guide(
     provider: str = "generic",
     tool: str = "generic",
 ) -> str:
-    watch = f"http://{address}:{settings.jellyfin_port}" if address else ""
-    search = f"http://{address}:{settings.seerr_port}" if address else ""
     lines = ["Home network address", ""]
     if not address:
         lines.append("This computer's home-network address could not be detected.")
         lines.append("On another device on the same Wi-Fi, you need the address from: ip -4 addr")
-        lines.append("It usually starts with 192.168. Open that address with :8096 to watch.")
+        lines.append("It usually starts with 192.168. Add :8096 to watch, :5055 to search,")
+        lines.append(":7878 for movies, :8989 for TV, :9696 for indexers, and :8080 for downloads.")
         return "\n".join(lines)
-    lines.append(f"Watch        {watch}")
-    lines.append(f"Search       {search}")
-    lines.append("Open those from a phone, computer, or TV on the same Wi-Fi.")
+    lines.extend(lan_page_lines(address, settings))
+    lines.append("Open any of these from another computer on the same Wi-Fi.")
+    lines.append("A server with no desktop can be set up from a laptop using these addresses.")
     lines.append("Use the same username and password. A phone on mobile data cannot open them.")
     lines.append("")
     lines.append("The address can change when the router restarts. Reserve it so it stays.")
@@ -2242,6 +2270,8 @@ def lan_access_guide(
     lines.extend(provider_static_steps(provider, address, gateway or "the router", mac))
     lines.append("")
     lines.extend(computer_static_steps(tool, interface, address, prefix, gateway))
+    lines.append("")
+    lines.append(lan_firewall_block(settings))
     return "\n".join(lines)
 
 
@@ -2389,28 +2419,26 @@ def try_upnp_forward(
 
 
 def setup_lan(settings: Settings, address: str | None = None) -> str:
-    """Publish the player and the search page to other devices on this Wi-Fi."""
+    """Publish every web page to other devices on this Wi-Fi."""
     host = lan_address() if address is None else address
     if not host:
         return (
             "This computer is set for the home network, and its address could not be detected.\n\n"
-            "On a phone or TV on the same Wi-Fi, open http://THIS-ADDRESS:"
-            f"{settings.jellyfin_port}\n"
-            "Find THIS-ADDRESS with: ip -4 addr\n"
-            "It usually starts with 192.168.\n\n"
-            "A phone on mobile data cannot open that address. "
+            "On another computer on the same Wi-Fi, use the address from: ip -4 addr\n"
+            "It usually starts with 192.168. Add :8096 to watch, :5055 to search,\n"
+            ":7878 for movies, :8989 for TV, :9696 for indexers, and :8080 for downloads.\n\n"
+            "A phone on mobile data cannot open those addresses. "
             "To watch away from home, rerun the installer and choose away from home."
         )
     settings.public_jellyfin_url = f"http://{host}:{settings.jellyfin_port}"
     settings.public_seerr_url = f"http://{host}:{settings.seerr_port}"
+    pages = "\n".join(lan_page_lines(host, settings))
     return (
-        f"On the same Wi-Fi, open {settings.public_jellyfin_url} to watch.\n"
-        f"The search page is {settings.public_seerr_url}\n"
-        "Use the same username and password. Nothing was opened to the internet.\n"
+        "On the same Wi-Fi, every page is open. Nothing was opened to the internet.\n"
+        f"{pages}\n"
+        "Use the same username and password. A server with no desktop can be set up from another computer.\n"
         "A phone on mobile data cannot open these addresses.\n"
-        "If a device on this Wi-Fi still cannot connect, a firewall on this computer may be blocking it. Run:\n"
-        f"  sudo ufw allow from 192.168.0.0/16 to any port {settings.jellyfin_port} proto tcp\n"
-        f"  sudo ufw allow from 192.168.0.0/16 to any port {settings.seerr_port} proto tcp\n"
+        f"{lan_firewall_block(settings)}\n"
         "To watch away from home, rerun the installer and choose away from home."
     )
 
@@ -2916,7 +2944,10 @@ def write_credentials(settings: Settings, api_keys: Mapping[str, str], remote_no
             lines.append(f"Jellyfin     {settings.public_jellyfin_url}")
         if settings.public_seerr_url:
             lines.append(f"Requests     {settings.public_seerr_url}")
-        lines.append("Sonarr, Radarr, Prowlarr, and qBittorrent stay on this computer.")
+        if settings.remote_access == "lan":
+            lines.append("Movies, TV, indexers, and downloads use the same home address, on their own ports.")
+        else:
+            lines.append("Sonarr, Radarr, Prowlarr, and qBittorrent stay on this computer.")
         if remote_note.strip():
             lines.append(remote_note.strip())
         lines.append("")

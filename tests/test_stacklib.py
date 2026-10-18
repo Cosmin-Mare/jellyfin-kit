@@ -692,6 +692,10 @@ class StacklibTests(unittest.TestCase):
         )
         self.assertIn("http://192.168.1.40:8096", guide)
         self.assertIn("http://192.168.1.40:5055", guide)
+        self.assertIn("http://192.168.1.40:7878", guide)
+        self.assertIn("http://192.168.1.40:8989", guide)
+        self.assertIn("http://192.168.1.40:9696", guide)
+        self.assertIn("http://192.168.1.40:8080", guide)
         self.assertIn("Digi", guide)
         self.assertIn("aa:bb:cc:dd:ee:ff", guide)
         self.assertIn("netplan apply", guide)
@@ -702,6 +706,8 @@ class StacklibTests(unittest.TestCase):
         self.assertEqual(settings.public_jellyfin_url, "http://192.168.1.20:8096")
         self.assertEqual(settings.public_seerr_url, "http://192.168.1.20:5055")
         self.assertIn("same Wi-Fi", note)
+        self.assertIn("http://192.168.1.20:8080", note)
+        self.assertIn("http://192.168.1.20:8989", note)
         self.assertIn("away from home", note)
 
     def test_hostname_accepts_a_pasted_url(self):

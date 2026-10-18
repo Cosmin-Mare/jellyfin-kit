@@ -1,5 +1,7 @@
 # Your own movie and TV library, one command
 
+![Installing the library, then opening the search page](docs/demo.gif)
+
 This sets up a private streaming library on a computer you control. You type the name of a movie or a show, click Request, and the computer downloads it and files it. You then press play in a browser, or in a TV app, the way you would on a streaming service. The files stay on your machine.
 
 You do not sign up for a website. One command installs the programs that do each job, creates one login for all of them, and connects them. When it finishes, it prints that username and password and saves them in a file called `credentials.txt`.
@@ -39,7 +41,7 @@ This follows [Bryce Hoehn's automated Jellyfin guide](https://github.com/bryce-h
 
 The player starts on the computer that ran the command. The install then asks where else you want to watch. Press Enter to keep the suggested answer. Skip this only when you pass `--remote` yourself, or when you pass `--yes`, which stays on this computer until you choose.
 
-**1. At home, on this Wi-Fi.** Phones, laptops, and TVs on the same network open the player. When the install finishes, it prints that address, usually starting with `192.168`, and the steps to keep it from changing. Those steps follow the router it recognizes, such as Digi, Orange, Vodafone, TP-Link, or Asus. Nothing is opened to the internet. A phone on mobile data cannot use that address. To choose this without the question:
+**1. At home, on this Wi-Fi.** Phones, laptops, and TVs on the same network can open every page: the player, the search, the movie shelf, the TV shelf, the indexers, and the downloader. That matters on an Ubuntu server, which has no desktop browser of its own. When the install finishes, it prints each address, usually starting with `192.168`, and the steps to keep that address from changing. Those steps follow the router it recognizes, such as Digi, Orange, Vodafone, TP-Link, or Asus. Nothing is opened to the internet. A phone on mobile data cannot use those addresses. To choose this without the question:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/install.sh | bash -s -- --remote lan
