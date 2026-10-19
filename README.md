@@ -99,7 +99,21 @@ curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/insta
 
 From a checkout of this repo, `./install.sh` does the same thing in that directory.
 
-Provider names and extra settings are in the [Gluetun wiki](https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers). An extra setting uses a `GLUETUN_` prefix, so `GLUETUN_SERVER_COUNTRIES=Netherlands` becomes `SERVER_COUNTRIES` in the container.
+Provider names and extra settings are in the [Gluetun wiki](https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers). An extra setting uses a `GLUETUN_` prefix, so `GLUETUN_SERVER_COUNTRIES=Netherlands` becomes `SERVER_COUNTRIES` in the container. Pass the provider with `VPN_SERVICE_PROVIDER`, for example `VPN_SERVICE_PROVIDER=mullvad`.
+
+The command cannot open the VPN account. These are accounts you create yourself. Prices are what those companies listed in autumn 2026. A cheap monthly figure usually means you pay for a year or two up front, and the renewal is higher.
+
+| Account | Gluetun name | Torrent traffic | Data | Price |
+| --- | --- | --- | --- | --- |
+| Privado, free | `privado` | Allowed | 10 GB a month | Free |
+| Proton VPN, free | `protonvpn` | Blocked on the free servers | No cap | Free |
+| Windscribe, free | `windscribe` | Stalls on the free servers in recent tests | 2 GB, or 10 GB after you confirm the email | Free |
+| Mullvad | `mullvad` | Allowed | No cap. Five devices at once. | €5 a month, no yearly lock-in |
+| IVPN Standard | `ivpn` | Allowed | No monthly cap on the plan | $6 a month |
+| Proton VPN Plus | `protonvpn` | Allowed | No monthly cap on the plan | $9.99 a month, or $3.49 a month if you pay two years at once |
+| Privado, paid | `privado` | Allowed | The 10 GB cap is lifted | About $11 a month |
+
+Privado's free plan is the one that allows torrent traffic without a bill. 10 GB is about one film. Proton's free plan is selected with `GLUETUN_FREE_ONLY=on`. Mullvad dropped OpenVPN in January 2026, so use the WireGuard command above. Privado uses the OpenVPN command. IVPN is the name the installer suggests when it asks.
 
 When it finishes, it prints the password and saves it in `credentials.txt`. Sign in with that password on every address in the table above. Start with Seerr at http://127.0.0.1:5055 if you want to request something, or Jellyfin at http://127.0.0.1:8096 if you only want to play what is already on disk.
 
@@ -107,10 +121,12 @@ Radarr is at http://127.0.0.1:7878, Sonarr at http://127.0.0.1:8989, Prowlarr at
 
 With the VPN on, qBittorrent, Prowlarr, and FlareSolverr leave through the VPN. Jellyfin, Seerr, Sonarr, and Radarr stay on your normal network.
 
-If the command stops early, read the message and run the command it prints. Two common ones:
+If the command stops early, read the message and run the command it prints. Common ones:
 
 - The VPN login is missing. Pass `OPENVPN_USER` and `OPENVPN_PASSWORD`, or rerun with `--no-vpn`.
 - Docker could not start. On Linux, run `sudo systemctl start docker` and rerun the curl command. On macOS or Windows, open Docker Desktop and rerun it.
+- A port is already taken. The message names the program on that port. qBittorrent uses 8080, which many other programs also use. Set `QBIT_PORT` to a free port, such as 8090, and rerun. Jellyfin, Seerr, and the shelves have the same kind of variable in `.env.example`. Port 6881 belongs to downloads. If another program has it, stop that program and rerun. That port cannot be moved.
+- A container named `jellyfin` or `qbittorrent` is already running from another setup. The message names it. Stop and remove that container, then rerun. Folders that setup mounted are left where they are. Its settings, watch history, and download queue stay in the old config folder. This installer starts new ones. A container from somewhere else is not treated as this install.
 
 ## 2. Tell it where to search
 
@@ -167,13 +183,15 @@ CLOUDFLARE_API_TOKEN='paste-token' CLOUDFLARE_HOSTNAME='watch.example.com' ./ins
 
 The command creates a tunnel named `jellyfin`, points `watch.example.com` at Jellyfin, and points `requests.example.com` at Seerr. Open `https://watch.example.com`.
 
+If this computer already logged in to Cloudflare with `cloudflared` (`~/.cloudflared/cert.pem`), you can skip the token. Run `./install.sh --yes --remote cloudflare`. The command reads the domain from the tunnel config already on the computer. A hostname such as `ha.example.com` means the player is `watch.example.com` and requests are `requests.example.com`. Set `CLOUDFLARE_HOSTNAME` when you want a different name. Tunnels you already run for other programs are left as they are.
+
 `CLOUDFLARE_SEERR_HOSTNAME=off` keeps Seerr on this computer. If you would rather attach the names in the dashboard, pass `CLOUDFLARE_TUNNEL_TOKEN` from the tunnel page. The service addresses to enter there are `http://jellyfin:8096` and `http://seerr:5055`.
 
 What the command does when Cloudflare is not ready yet:
 
 | What happened | What you do |
 | --- | --- |
-| The token was left out | It stops before Docker and prints the token page plus the command to rerun. A password you already entered stays in `.env`. |
+| The token was left out, and cloudflared has not logged in | It stops before Docker and prints the token page plus the command to rerun. A password you already entered stays in `.env`. |
 | Cloudflare rejected the token | Add the missing permission on the token page. The local server is left running. Rerun the same command. |
 | The domain is not on this account | Add the domain, wait until it says Active, and use the nameservers Cloudflare shows you. Then rerun. |
 | That hostname is already a DNS record of another type | Delete or rename it on the DNS page, then rerun. |
@@ -218,7 +236,9 @@ If the link expired, run `sudo tailscale up`, open the new link, and rerun the i
 
 After the first request works, daily use is the search page and the player. Open Seerr, request a title, and later open Jellyfin to watch it.
 
-Movies you already own can be copied into the `media/movies` folder, and shows into `media/tv`. In Jellyfin, open that library's menu and choose **Scan library** so they appear. New downloads arrive in `downloads/completed`, then the movie shelf or the TV shelf moves them into those folders for you.
+Movies you already own can be copied into the `media/movies` folder, and shows into `media/tv`. In Jellyfin, open that library's menu and choose **Scan library** so they appear. Jellyfin starts with those two libraries. A music folder next to them stays on disk until you add a library that points at it. New downloads arrive in `downloads/completed`, then the movie shelf or the TV shelf moves them into those folders for you. An older qBittorrent often saved into `downloads/complete` instead. Those files stay put. Move them into `completed` if you want the shelves to pick them up.
+
+To have the movie shelf manage files that were already in `media/movies`, open Radarr and choose **Movies → Import Existing Movies**. Sonarr has the same import for `media/tv`. Until you do that, the player can play the files, and a later Request can download a second copy.
 
 Run the curl command again, or `./install.sh` from `~/jellyfin-kit`, to repair the links. It keeps the password already in `.env` and asks before changing a config that is already there. `./install.sh --configure-only` skips Docker and only redoes the accounts.
 

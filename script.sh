@@ -46,6 +46,11 @@ one that pulls container images.
    A missing VPN login wants OPENVPN_USER and OPENVPN_PASSWORD,
    or --no-vpn. A missing Docker install wants Docker Desktop on a Mac
    or Windows machine, then the same ./install.sh again.
+   A taken port names the program. qBittorrent's page is 8080, which is
+   often already used: set QBIT_PORT to a free port and rerun. Port 6881
+   is the download port and cannot be moved. A container named jellyfin
+   or qbittorrent from another setup has to be stopped and removed first.
+   Its folders stay where they are.
 
 2. Add an indexer
    In Prowlarr, open Indexers, Add Indexer, and choose Torznab.
@@ -86,7 +91,10 @@ one that pulls container images.
    with Account / Cloudflare Tunnel / Edit, Zone / DNS / Edit, and
    Zone / Zone / Read. watch.example.com plays Jellyfin.
    requests.example.com is the request page.
-   A missing token stops before Docker and prints the page to open.
+   A missing token stops before Docker and prints the page to open,
+   unless this computer already has ~/.cloudflared/cert.pem. That login
+   is reused. A new tunnel named jellyfin is created, and tunnels you
+   already run are left alone. The domain is taken from that config.
    A rejected token, a domain that is not on the account, or a hostname
    that is already a different DNS record leaves the local server up
    and prints what to fix. Long videos can fail on a free Cloudflare

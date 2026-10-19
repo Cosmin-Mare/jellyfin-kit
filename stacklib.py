@@ -286,7 +286,12 @@ def confirm(label: str, default: bool = True, assume_yes: bool = False) -> bool:
     return typed in {"y", "yes"}
 
 
-def render_compose(use_vpn: bool, gluetun_env: Iterable[str] = (), cloudflare: bool = False) -> str:
+def render_compose(
+    use_vpn: bool,
+    gluetun_env: Iterable[str] = (),
+    cloudflare: bool = False,
+    cloudflare_local: bool = False,
+) -> str:
     """Compose file for the guide's stack, plus Seerr for requests."""
     reserved = {
         "PUID",
@@ -492,7 +497,24 @@ services:
       - radarr
     restart: unless-stopped
 """
-    if cloudflare:
+    # The credentials file is mode 600. The image's default user cannot read it.
+    # Root can, which is also how an existing cloudflared container is usually run.
+    if cloudflare_local:
+        rendered += """
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    user: "0:0"
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+    volumes:
+      - ${CONFIG_DIR}/cloudflared/config.yml:/etc/cloudflared/config.yml:ro
+      - ${CONFIG_DIR}/cloudflared/credentials.json:/etc/cloudflared/credentials.json:ro
+    depends_on:
+      - jellyfin
+      - seerr
+    restart: unless-stopped
+"""
+    elif cloudflare:
         rendered += """
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -1804,6 +1826,220 @@ def tunnel_token_note(settings: Settings) -> str:
     )
 
 
+TUNNEL_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+
+
+def cloudflared_cert() -> Path | None:
+    """Certificate from `cloudflared login`. Empty when this computer has not logged in."""
+    chosen = os.environ.get("CLOUDFLARED_CERT", "").strip()
+    path = Path(chosen) if chosen else Path.home() / ".cloudflared" / "cert.pem"
+    return path if path.is_file() else None
+
+
+def cloudflared_hostnames(text: str) -> list[str]:
+    found: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip().lstrip("-").strip()
+        if stripped.startswith("#") or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        if key.strip() == "hostname" and value.strip():
+            found.append(value.strip())
+    return found
+
+
+def zone_from_hostnames(hostnames: Iterable[str]) -> str:
+    """Parent domain shared by existing tunnel hostnames, such as ha.example.com -> example.com."""
+    counts: dict[str, int] = {}
+    for host in hostnames:
+        labels = [part for part in host.strip(".").lower().split(".") if part]
+        if len(labels) < 3:
+            continue
+        zone = ".".join(labels[-2:])
+        counts[zone] = counts.get(zone, 0) + 1
+    if not counts:
+        return ""
+    return max(counts, key=lambda zone: (counts[zone], len(zone)))
+
+
+def parse_tunnel_table(text: str) -> list[tuple[str, str]]:
+    """Rows of (id, name) from `cloudflared tunnel list`."""
+    rows: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        match = TUNNEL_ID_RE.search(line)
+        if not match:
+            continue
+        rest = line[match.end():].split()
+        if rest:
+            rows.append((match.group(0), rest[0]))
+    return rows
+
+
+def parse_created_tunnel(text: str) -> str:
+    match = re.search(r"with id\s+(" + TUNNEL_ID_RE.pattern + r")", text, flags=re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def existing_cloudflared_hostnames() -> list[str]:
+    found: list[str] = []
+    for path in (Path.home() / ".cloudflared" / "config.yml",):
+        if path.is_file():
+            found.extend(cloudflared_hostnames(path.read_text(encoding="utf-8", errors="replace")))
+    return found
+
+
+def _name_list(names: list[str]) -> str:
+    if len(names) <= 1:
+        return names[0] if names else ""
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return ", ".join(names[:-1]) + f", and {names[-1]}"
+
+
+def local_cloudflare_config(tunnel_id: str, jellyfin_host: str, seerr_host: str | None) -> str:
+    lines = [
+        f"tunnel: {tunnel_id}",
+        "credentials-file: /etc/cloudflared/credentials.json",
+        "",
+        "ingress:",
+        f"  - hostname: {jellyfin_host}",
+        "    service: http://jellyfin:8096",
+    ]
+    if seerr_host:
+        lines.extend(
+            [
+                f"  - hostname: {seerr_host}",
+                "    service: http://seerr:5055",
+            ]
+        )
+    lines.extend(["  - service: http_status:404", ""])
+    return "\n".join(lines)
+
+
+def run_cloudflared(args: list[str]) -> subprocess.CompletedProcess[str]:
+    if shutil.which("cloudflared") is None:
+        raise SetupError(
+            "cloudflared is not installed, so the existing login cannot be used.\n\n"
+            "Install it, or create an API token and rerun with CLOUDFLARE_API_TOKEN.\n"
+            "https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/"
+        )
+    return subprocess.run(["cloudflared", *args], check=False, capture_output=True, text=True)
+
+
+def provision_local_cloudflare(
+    settings: Settings,
+    run: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
+    cert: Path | None = None,
+    config_dir: Path | None = None,
+    hostnames: Iterable[str] | None = None,
+) -> str:
+    """Attach Jellyfin to a new tunnel using the cloudflared login already on this computer.
+
+    Tunnels that already exist for other programs are left alone.
+    """
+    runner = run or run_cloudflared
+    certificate = cert if cert is not None else cloudflared_cert()
+    if certificate is None:
+        raise SetupError(cloudflare_setup_help(settings))
+    known = list(hostnames) if hostnames is not None else existing_cloudflared_hostnames()
+    if not settings.cloudflare_hostname:
+        zone = zone_from_hostnames(known)
+        if not zone:
+            raise SetupError(
+                "Cloudflare is already logged in on this computer, and the hostname was not set.\n\n"
+                "Rerun with CLOUDFLARE_HOSTNAME='watch.example.com' and --remote cloudflare."
+            )
+        settings.cloudflare_hostname = normalize_hostname("watch." + zone)
+    if settings.cloudflare_hostname in {item.lower() for item in known}:
+        raise SetupError(
+            f"{settings.cloudflare_hostname} is already used by another tunnel on this computer.\n\n"
+            "Pick a different name with CLOUDFLARE_HOSTNAME and rerun."
+        )
+    zone_name = ".".join(settings.cloudflare_hostname.split(".")[1:])
+    seerr_host = seerr_public_hostname(settings, zone_name)
+    if seerr_host and seerr_host in {item.lower() for item in known}:
+        raise SetupError(
+            f"{seerr_host} is already used by another tunnel on this computer.\n\n"
+            "Set CLOUDFLARE_SEERR_HOSTNAME to a free name, or off, and rerun."
+        )
+
+    listed = runner(["tunnel", "list"])
+    if listed.returncode != 0:
+        detail = (listed.stderr or listed.stdout or "cloudflared tunnel list failed").strip()
+        raise SetupError(
+            "The Cloudflare login on this computer could not list tunnels.\n\n"
+            f"{detail}\n\n"
+            "Run `cloudflared tunnel login` if that login has expired, then rerun ./install.sh --remote cloudflare."
+        )
+    tunnels = parse_tunnel_table((listed.stdout or "") + "\n" + (listed.stderr or ""))
+    tunnel_id = next((item_id for item_id, name in tunnels if name == TUNNEL_NAME), "")
+    if not tunnel_id:
+        created = runner(["tunnel", "create", TUNNEL_NAME])
+        output = (created.stdout or "") + "\n" + (created.stderr or "")
+        tunnel_id = parse_created_tunnel(output)
+        if created.returncode != 0 or not tunnel_id:
+            detail = output.strip() or "cloudflared tunnel create failed"
+            raise SetupError(
+                "Cloudflare did not create the jellyfin tunnel.\n\n"
+                f"{detail}"
+            )
+    settings.cloudflare_tunnel_id = tunnel_id
+
+    source = certificate.parent / f"{tunnel_id}.json"
+    if not source.is_file():
+        raise SetupError(
+            f"The tunnel {TUNNEL_NAME} exists, and its credentials file is missing.\n\n"
+            f"Expected {source}.\n"
+            "If that file was moved, put it back, or delete the tunnel in Cloudflare and rerun."
+        )
+    destination_dir = config_dir if config_dir is not None else (ROOT / settings.config_dir / "cloudflared")
+    if not destination_dir.is_absolute():
+        destination_dir = ROOT / destination_dir
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    credentials = destination_dir / "credentials.json"
+    credentials.write_bytes(source.read_bytes())
+    os.chmod(credentials, 0o600)
+    (destination_dir / "config.yml").write_text(
+        local_cloudflare_config(tunnel_id, settings.cloudflare_hostname, seerr_host),
+        encoding="utf-8",
+    )
+
+    for hostname in [settings.cloudflare_hostname, seerr_host]:
+        if not hostname:
+            continue
+        routed = runner(["tunnel", "route", "dns", TUNNEL_NAME, hostname])
+        if routed.returncode != 0:
+            detail = (routed.stderr or routed.stdout or "cloudflared tunnel route dns failed").strip()
+            if "already exists" in detail.lower():
+                info = runner(["tunnel", "info", TUNNEL_NAME])
+                info_text = (info.stdout or "") + "\n" + (info.stderr or "")
+                if hostname in info_text:
+                    continue
+            raise SetupError(
+                f"Cloudflare did not attach {hostname} to the jellyfin tunnel.\n\n"
+                f"{detail}\n\n"
+                "If that name is already a DNS record, delete or rename it in the dashboard, then rerun."
+            )
+
+    settings.public_jellyfin_url = f"https://{settings.cloudflare_hostname}"
+    if seerr_host:
+        settings.cloudflare_seerr_hostname = seerr_host
+        settings.public_seerr_url = f"https://{seerr_host}"
+    else:
+        settings.cloudflare_seerr_hostname = "off"
+        settings.public_seerr_url = ""
+    requests = f" Requests: {settings.public_seerr_url}." if settings.public_seerr_url else ""
+    kept = sorted({name for _item_id, name in tunnels if name != TUNNEL_NAME})
+    word = "tunnel" if len(kept) == 1 else "tunnels"
+    left = f" Left the existing {_name_list(kept)} {word} alone." if kept else ""
+    return (
+        "Cloudflare Tunnel is attached, using the login already on this computer."
+        f"{requests}{left}\n"
+        "The service addresses inside the tunnel are http://jellyfin:8096 and http://seerr:5055.\n"
+        "Long videos can fail on a free Cloudflare plan. If playback stops, rerun with --remote forward."
+    )
+
+
 def tunnel_log_connected(text: str) -> bool:
     lowered = text.lower()
     return "registered tunnel connection" in lowered
@@ -2042,7 +2278,7 @@ def match_network_provider(text: str) -> str:
         ("vodafone", ("vodafone", "easybox")),
         ("telekom", ("telekom", "cosmote")),
         ("fritz", ("fritz!box", "fritzbox", "avm gmbh")),
-        ("tplink", ("tp-link", "tplink", "archer")),
+        ("tplink", ("tp-link", "tplink", "archer", "tpencrypt")),
         ("asus", ("asuswrt", "rt-ax", "rt-ac", "asus")),
         ("netgear", ("netgear", "orbi")),
         ("unifi", ("unifi", "ubiquiti")),
@@ -2056,20 +2292,40 @@ def match_network_provider(text: str) -> str:
     return "generic"
 
 
+def meta_refresh_target(body: str, base: str) -> str:
+    """The next page from a meta refresh, or empty. Many routers put the brand there, not on /."""
+    match = re.search(r"<meta[^>]+http-equiv=[\"']?refresh[\"']?[^>]*>", body, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    target = re.search(r"url\s*=\s*([^\"'\s>;]+)", match.group(0), flags=re.IGNORECASE)
+    if not target:
+        return ""
+    return urllib.parse.urljoin(base, target.group(1).strip())
+
+
 def router_banner(gateway: str) -> str:
     if not gateway:
         return ""
     chunks = [gateway]
+    base = f"http://{gateway}/"
     try:
-        _status, body = http_exchange(f"http://{gateway}/", timeout=3)
+        _status, body = http_exchange(base, timeout=3)
     except SetupError:
         body = ""
+    refresh = meta_refresh_target(body, base)
+    if refresh and refresh.rstrip("/") != base.rstrip("/"):
+        try:
+            _status, followed = http_exchange(refresh, timeout=3)
+        except SetupError:
+            followed = ""
+        if followed:
+            body = body + "\n" + followed[:4000]
     title = ""
     match = re.search(r"<title[^>]*>(.*?)</title>", body, flags=re.IGNORECASE | re.DOTALL)
     if match:
         title = re.sub(r"\s+", " ", match.group(1)).strip()
     chunks.append(title)
-    chunks.append(body[:2000])
+    chunks.append(body[:6000])
     return " ".join(chunks)
 
 
@@ -2784,7 +3040,9 @@ def require_cloudflare_credentials(settings: Settings) -> None:
     if settings.remote_access != "cloudflare":
         return
     if not settings.cloudflare_api_token and not settings.cloudflare_tunnel_token:
-        raise SetupError(cloudflare_setup_help(settings))
+        if cloudflared_cert() is None:
+            raise SetupError(cloudflare_setup_help(settings))
+        return
     if settings.cloudflare_api_token and not settings.cloudflare_hostname and not settings.cloudflare_tunnel_token:
         raise SetupError(
             "Cloudflare needs the hostname people will open, such as watch.example.com.\n\n"
@@ -2913,8 +3171,8 @@ def write_credentials(settings: Settings, api_keys: Mapping[str, str], remote_no
         f"Radarr API key:   {api_keys.get('radarr', '')}",
         f"Prowlarr API key: {api_keys.get('prowlarr', '')}",
         "",
-        "Libraries:  ./media/movies and ./media/tv",
-        "Downloads:  ./downloads/completed and ./downloads/incomplete",
+        f"Libraries:  {settings.media_dir.rstrip('/')}/movies and {settings.media_dir.rstrip('/')}/tv",
+        f"Downloads:  {settings.download_dir.rstrip('/')}/completed and {settings.download_dir.rstrip('/')}/incomplete",
         "",
     ]
     if settings.vpn_enabled:
@@ -2967,6 +3225,233 @@ APP_PARTS = (
 )
 
 
+STACK_PROJECT = "jellyfin"
+TORRENT_PORT = "6881"
+
+
+def required_container_names(use_vpn: bool, cloudflare: bool = False) -> list[str]:
+    names = ["jellyfin", "qbittorrent", "prowlarr", "flaresolverr", "sonarr", "radarr", "seerr"]
+    if use_vpn:
+        names.append("gluetun")
+    if cloudflare:
+        names.append("cloudflared")
+    return names
+
+
+def required_host_ports(settings: Settings) -> list[tuple[str, str, str]]:
+    """Host ports the compose file publishes: (port, app, env var or empty when the port is fixed)."""
+    return [
+        (str(settings.jellyfin_port), "Jellyfin", "JELLYFIN_PORT"),
+        (str(settings.seerr_port), "Seerr", "SEERR_PORT"),
+        (str(settings.radarr_port), "Radarr", "RADARR_PORT"),
+        (str(settings.sonarr_port), "Sonarr", "SONARR_PORT"),
+        (str(settings.prowlarr_port), "Prowlarr", "PROWLARR_PORT"),
+        (str(settings.flaresolverr_port), "FlareSolverr", "FLARESOLVERR_PORT"),
+        (str(settings.qbit_port), "qBittorrent", "QBIT_PORT"),
+        (TORRENT_PORT, "qBittorrent downloads", ""),
+    ]
+
+
+def parse_docker_ps(text: str) -> list[tuple[str, str, str]]:
+    """Lines of name, compose project, published ports."""
+    records: list[tuple[str, str, str]] = []
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3 or not parts[0].strip():
+            continue
+        records.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
+    return records
+
+
+def parse_published_ports(ports: str) -> list[str]:
+    found: list[str] = []
+    for match in re.finditer(r":(\d+)(?:-(\d+))?->", ports):
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if end < start or end - start > 50:
+            continue
+        found.extend(str(port) for port in range(start, end + 1))
+    return found
+
+
+def _ss_local_address(parts: list[str]) -> str:
+    """Local address field from `ss`. TCP-only output has no Netid column; TCP+UDP does."""
+    for index, part in enumerate(parts[:-1]):
+        if ":" not in part:
+            continue
+        port = part.rsplit(":", 1)[-1]
+        if not port.isdigit():
+            continue
+        if ":" in parts[index + 1]:
+            return part
+    return ""
+
+
+def parse_ss_listeners(text: str) -> dict[str, str]:
+    """Map a listening port to a short description from `ss -H -lntup`."""
+    owners: dict[str, str] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        local = _ss_local_address(parts)
+        if not local:
+            continue
+        port = local.rsplit(":", 1)[-1]
+        process = re.search(r'\("([^"]+)"', line)
+        description = f"process {process.group(1)}" if process else "another program"
+        if port not in owners or owners[port] == "another program":
+            owners[port] = description
+    return owners
+
+
+def describe_start_blockers(
+    settings: Settings,
+    *,
+    use_vpn: bool,
+    cloudflare: bool,
+    containers: Iterable[tuple[str, str, str]],
+    listeners: Mapping[str, str],
+) -> str:
+    """Explain name and port conflicts before Docker starts half the stack."""
+    wanted = set(required_container_names(use_vpn, cloudflare))
+    foreign: list[tuple[str, str]] = []
+    own_ports: set[str] = set()
+    for name, project, ports in containers:
+        if project == STACK_PROJECT:
+            own_ports.update(parse_published_ports(ports))
+        if name in wanted and project != STACK_PROJECT:
+            where = f"project {project}" if project else "not started by this installer"
+            foreign.append((name, where))
+
+    paragraphs: list[str] = []
+    if foreign:
+        lines = ["These container names are already in use:"]
+        for name, where in foreign:
+            lines.append(f"  {name}  ({where})")
+        joined = " ".join(name for name, _where in foreign)
+        lines.extend(
+            [
+                "",
+                "This installer starts its own containers with those names.",
+                "Stop the ones above and remove the containers. That also frees the ports they are holding.",
+                "Folders you mounted are left in place.",
+                "",
+                f"  docker stop {joined}",
+                f"  docker rm {joined}",
+            ]
+        )
+        paragraphs.append("\n".join(lines))
+
+    needed = required_host_ports(settings)
+    claimed: dict[str, list[tuple[str, str]]] = {}
+    for port, label, env in needed:
+        claimed.setdefault(port, []).append((label, env))
+    duplicate_lines: list[str] = []
+    for port, items in claimed.items():
+        if len(items) < 2:
+            continue
+        labels = " and ".join(label for label, _env in items)
+        variables = " and ".join(env for _label, env in items if env)
+        duplicate_lines.append(
+            f"Port {port} is set for both {labels}. Give them different ports ({variables}) and rerun ./install.sh."
+        )
+    if duplicate_lines:
+        paragraphs.append("\n".join(duplicate_lines))
+
+    foreign_names = {name.lower() for name, _where in foreign}
+    busy: list[tuple[str, str, str, str]] = []
+    for port, label, env in needed:
+        if port in own_ports:
+            continue
+        holder = listeners.get(port, "")
+        if not holder:
+            continue
+        # A host-network container does not list its ports in `docker ps`.
+        # The process name still contains the container name. Stopping that
+        # container frees the port, so it is not a second problem.
+        if any(name in holder.lower() for name in foreign_names):
+            continue
+        busy.append((port, label, env, holder))
+    if busy:
+        lines = ["These ports are already taken:"]
+        seen_env: set[str] = set()
+        hints: list[tuple[str, str]] = []
+        fixed: list[str] = []
+        for port, label, env, holder in busy:
+            lines.append(f"  {port}  {label}  ({holder})")
+            if env and env not in seen_env:
+                seen_env.add(env)
+                hints.append((env, port))
+            elif not env and port not in fixed:
+                fixed.append(port)
+        lines.append("")
+        if hints:
+            lines.append("Pick a free port and rerun. Set it in .env, or put it in front of the command:")
+            lines.append("")
+            taken = set(listeners) | {port for port, _label, _env in needed}
+            for env, port in hints:
+                example = _example_free_port(taken, avoid=port)
+                lines.append(f"  {env}={example} ./install.sh")
+                taken.add(example)
+            if any(port == "8080" for _env, port in hints):
+                lines.append("")
+                lines.append("qBittorrent uses 8080 unless QBIT_PORT says otherwise. A lot of other programs use 8080 too.")
+        if fixed:
+            shown = " and ".join(fixed)
+            lines.append(
+                f"Port {shown} is the download port. It cannot be moved. "
+                "Stop the program using it, then rerun ./install.sh."
+            )
+        paragraphs.append("\n".join(lines).rstrip())
+
+    if not paragraphs:
+        return ""
+    return "The apps cannot start yet.\n\n" + "\n\n".join(paragraphs)
+
+
+def _example_free_port(taken: set[str], avoid: str) -> str:
+    for candidate in ("8090", "8081", "18080", "8888"):
+        if candidate != avoid and candidate not in taken:
+            return candidate
+    return "18080"
+
+
+def collect_start_blockers(settings: Settings, use_vpn: bool, cloudflare: bool) -> str:
+    try:
+        command = docker_command()
+    except SetupError:
+        return ""
+    result = subprocess.run(
+        command
+        + [
+            "ps",
+            "-a",
+            "--format",
+            '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.Ports}}',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return ""
+    listeners: dict[str, str] = {}
+    if shutil.which("ss"):
+        probed = subprocess.run(["ss", "-H", "-lntup"], check=False, capture_output=True, text=True)
+        listeners.update(parse_ss_listeners(probed.stdout))
+    for name, project, ports in parse_docker_ps(result.stdout):
+        if project == STACK_PROJECT:
+            continue
+        for port in parse_published_ports(ports):
+            listeners[port] = f"container {name}"
+    return describe_start_blockers(
+        settings,
+        use_vpn=use_vpn,
+        cloudflare=cloudflare,
+        containers=parse_docker_ps(result.stdout),
+        listeners=listeners,
+    )
+
+
 def classify_install(
     config_dir: Path,
     containers: Iterable[str],
@@ -2996,7 +3481,15 @@ def list_container_names() -> list[str]:
     except SetupError:
         return []
     result = subprocess.run(
-        command + ["ps", "-a", "--format", "{{.Names}}"],
+        command
+        + [
+            "ps",
+            "-a",
+            "--filter",
+            f"label=com.docker.compose.project={STACK_PROJECT}",
+            "--format",
+            "{{.Names}}",
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -3041,32 +3534,42 @@ def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | 
     require_cloudflare_credentials(settings)
     remote_note = ""
     cloudflare_error = ""
+    local_tunnel = False
     try:
         if settings.remote_access == "cloudflare" and settings.cloudflare_api_token:
             print("Setting up the Cloudflare tunnel...")
             remote_note = provision_cloudflare(settings)
-        elif settings.remote_access == "cloudflare":
+        elif settings.remote_access == "cloudflare" and settings.cloudflare_tunnel_token:
             remote_note = tunnel_token_note(settings)
+        elif settings.remote_access == "cloudflare" and cloudflared_cert() is not None:
+            print("Using the Cloudflare login already on this computer...")
+            remote_note = provision_local_cloudflare(settings)
+            local_tunnel = True
     except SetupError as error:
         cloudflare_error = str(error)
         remote_note = cloudflare_error
+        local_tunnel = False
     finally:
         write_env_file(ENV_PATH, settings, extras)
-    prepare_directories(settings)
     gluetun_names = [key.removeprefix("GLUETUN_") for key in extras]
     use_tunnel = settings.remote_access == "cloudflare" and bool(settings.cloudflare_tunnel_token)
+    if not configure_only:
+        blocked = collect_start_blockers(settings, settings.vpn_enabled, use_tunnel or local_tunnel)
+        if blocked:
+            raise SetupError(blocked)
+    prepare_directories(settings)
     (ROOT / "docker-compose.yml").write_text(
-        render_compose(True, gluetun_names, cloudflare=use_tunnel),
+        render_compose(True, gluetun_names, cloudflare=use_tunnel, cloudflare_local=local_tunnel),
         encoding="utf-8",
     )
     (ROOT / "docker-compose.novpn.yml").write_text(
-        render_compose(False, cloudflare=use_tunnel),
+        render_compose(False, cloudflare=use_tunnel, cloudflare_local=local_tunnel),
         encoding="utf-8",
     )
     if not configure_only:
         print("Starting containers..." if repair else "Starting anything that is not running yet...")
         compose_up(settings.vpn_enabled)
-    elif use_tunnel:
+    elif use_tunnel or local_tunnel:
         print("Starting the Cloudflare tunnel...")
         compose_up(settings.vpn_enabled, services=["cloudflared"])
     configurator = StackConfigurator(
@@ -3138,7 +3641,7 @@ def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | 
             os.chmod(CREDENTIALS_PATH, 0o600)
     if cloudflare_error:
         raise SetupError(cloudflare_error)
-    if use_tunnel:
+    if use_tunnel or local_tunnel:
         wait_for_cloudflared(settings)
 
 

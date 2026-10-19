@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import subprocess
 import sys
 import threading
 import unittest
@@ -627,8 +628,9 @@ class StacklibTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             with unittest.mock.patch.object(stacklib, "ENV_PATH", Path(tmp) / ".env"):
                 settings, _extras = stacklib.collect_settings(assume_yes=True, no_vpn=True, remote="cloudflare")
-                with self.assertRaises(stacklib.SetupError) as raised:
-                    stacklib.require_cloudflare_credentials(settings)
+                with unittest.mock.patch.object(stacklib, "cloudflared_cert", return_value=None):
+                    with self.assertRaises(stacklib.SetupError) as raised:
+                        stacklib.require_cloudflare_credentials(settings)
         text = str(raised.exception)
         self.assertIn("api-tokens", text)
         self.assertIn("CLOUDFLARE_API_TOKEN", text)
@@ -679,7 +681,26 @@ class StacklibTests(unittest.TestCase):
         self.assertEqual(stacklib.match_network_provider("Digi Romania router login"), "digi")
         self.assertEqual(stacklib.match_network_provider("Livebox Orange"), "orange")
         self.assertEqual(stacklib.match_network_provider("TP-Link Archer"), "tplink")
+        self.assertEqual(stacklib.match_network_provider("script src=js/libs/tpEncrypt.js"), "tplink")
         self.assertEqual(stacklib.match_network_provider("unknown appliance"), "generic")
+        refresh = '<meta http-equiv="refresh" content="0; URL=/webpages/index.html" />'
+        self.assertEqual(
+            stacklib.meta_refresh_target(refresh, "http://192.168.1.1/"),
+            "http://192.168.1.1/webpages/index.html",
+        )
+        pages = {
+            "http://192.168.1.1/": (200, refresh),
+            "http://192.168.1.1/webpages/index.html": (200, '<script src="js/libs/tpEncrypt.js"></script>'),
+        }
+
+        def exchange(url, data=None, headers=None, timeout=8):
+            if url not in pages:
+                raise stacklib.SetupError(url)
+            return pages[url]
+
+        with unittest.mock.patch.object(stacklib, "http_exchange", exchange):
+            banner = stacklib.router_banner("192.168.1.1")
+        self.assertEqual(stacklib.match_network_provider(banner), "tplink")
         guide = stacklib.lan_access_guide(
             stacklib.Settings(),
             address="192.168.1.40",
@@ -729,6 +750,68 @@ class StacklibTests(unittest.TestCase):
         self.assertIn("cloudflare/cloudflared:latest", tunneled)
         self.assertIn("TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}", tunneled)
         self.assertIn("container_name: cloudflared", tunneled)
+        local = stacklib.render_compose(False, cloudflare_local=True)
+        self.assertIn("/etc/cloudflared/config.yml", local)
+        self.assertIn('user: "0:0"', local)
+        self.assertNotIn("TUNNEL_TOKEN", local)
+
+    def test_existing_cloudflared_login_gets_its_own_tunnel(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cert_dir = root / "cloudflared"
+            cert_dir.mkdir()
+            cert = cert_dir / "cert.pem"
+            cert.write_text("cert")
+            tunnel_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            calls = []
+
+            def run(args):
+                calls.append(list(args))
+                if args[:2] == ["tunnel", "list"]:
+                    text = (
+                        "ID                                   NAME          CREATED\n"
+                        "e1ee5d88-952b-47df-abf1-7d1de3390a10 grafana-logs  2026-08-21T10:46:06Z\n"
+                        "eb60d693-da4a-49e1-b58a-6383eea3e079 homeassistant 2026-04-27T18:40:24Z\n"
+                    )
+                    return subprocess.CompletedProcess(args, 0, text, "")
+                if args[:3] == ["tunnel", "create", "jellyfin"]:
+                    (cert_dir / f"{tunnel_id}.json").write_text("{}")
+                    return subprocess.CompletedProcess(
+                        args, 0, f"Created tunnel jellyfin with id {tunnel_id}\n", ""
+                    )
+                if args[:3] == ["tunnel", "route", "dns"]:
+                    return subprocess.CompletedProcess(args, 0, f"Added CNAME {args[-1]}\n", "")
+                return subprocess.CompletedProcess(args, 1, "", "unexpected")
+
+            settings = stacklib.Settings(use_vpn="0", remote_access="cloudflare")
+            note = stacklib.provision_local_cloudflare(
+                settings,
+                run=run,
+                cert=cert,
+                config_dir=root / "out",
+                hostnames=["ha.mare-cosmin.ro", "logs.mare-cosmin.ro"],
+            )
+            self.assertEqual(settings.public_jellyfin_url, "https://watch.mare-cosmin.ro")
+            self.assertEqual(settings.public_seerr_url, "https://requests.mare-cosmin.ro")
+            self.assertIn("grafana-logs and homeassistant", note)
+            config = (root / "out" / "config.yml").read_text(encoding="utf-8")
+            self.assertIn("http://jellyfin:8096", config)
+            self.assertIn("http://seerr:5055", config)
+            self.assertNotIn("ha.mare-cosmin.ro", config)
+            self.assertEqual((root / "out" / "credentials.json").stat().st_mode & 0o777, 0o600)
+            self.assertIn(["tunnel", "route", "dns", "jellyfin", "watch.mare-cosmin.ro"], calls)
+            self.assertNotIn("grafana-logs", config)
+
+    def test_zone_comes_from_existing_tunnel_hostnames(self):
+        text = "ingress:\n  - hostname: ha.mare-cosmin.ro\n    service: http://localhost:8123\n"
+        self.assertEqual(stacklib.cloudflared_hostnames(text), ["ha.mare-cosmin.ro"])
+        self.assertEqual(stacklib.zone_from_hostnames(["ha.mare-cosmin.ro", "logs.mare-cosmin.ro"]), "mare-cosmin.ro")
+        self.assertEqual(
+            stacklib.parse_tunnel_table(
+                "e1ee5d88-952b-47df-abf1-7d1de3390a10 grafana-logs  2026-08-21T10:46:06Z\n"
+            ),
+            [("e1ee5d88-952b-47df-abf1-7d1de3390a10", "grafana-logs")],
+        )
 
     def test_credentials_list_public_urls_and_keep_downloads_local(self):
         with TemporaryDirectory() as tmp:
@@ -746,7 +829,23 @@ class StacklibTests(unittest.TestCase):
             self.assertIn("https://watch.example.com", text)
             self.assertIn("https://requests.example.com", text)
             self.assertIn("stay on this computer", text)
+            self.assertIn("./media/movies", text)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_credentials_use_the_media_directory_you_set(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "credentials.txt"
+            with unittest.mock.patch.object(stacklib, "CREDENTIALS_PATH", path):
+                settings = stacklib.Settings(
+                    admin_password="secret",
+                    media_dir="/mnt/cdn-storage/media",
+                    download_dir="/mnt/cdn-storage/downloads",
+                    use_vpn="0",
+                )
+                stacklib.write_credentials(settings, {})
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("/mnt/cdn-storage/media/movies", text)
+            self.assertIn("/mnt/cdn-storage/downloads/completed", text)
 
     def test_cloudflare_error_tells_you_which_permission_to_add(self):
         message = stacklib.cloudflare_error_message(
@@ -967,6 +1066,87 @@ class StacklibTests(unittest.TestCase):
         self.assertIn("FlareSolverr", missing)
         self.assertNotIn("Gluetun", missing)
         self.assertNotIn("Gluetun", present)
+
+    def test_another_projects_containers_and_ports_are_named_before_start(self):
+        settings = stacklib.Settings(use_vpn="0", qbit_port="8080", jellyfin_port="8096")
+        docker_ps = "\n".join(
+            [
+                "jellyfin\tmedia-stack\t",
+                "qbittorrent\tmedia-stack\t",
+                "imgproxy\tcdn\t0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp",
+                "jellyfin-kit\tjellyfin\t0.0.0.0:8096->8096/tcp",
+            ]
+        )
+        ss = "\n".join(
+            [
+                'tcp LISTEN 0 4096 0.0.0.0:8080 0.0.0.0:* users:(("docker-proxy",pid=1,fd=4))',
+                'tcp LISTEN 0 512 *:8096 *:* users:(("jellyfin",pid=9,fd=8))',
+                'tcp LISTEN 0 30 192.168.1.153%enp0s31f6:6881 0.0.0.0:* users:(("qbittorrent-nox",pid=7,fd=16))',
+            ]
+        )
+        records = stacklib.parse_docker_ps(docker_ps)
+        listeners = stacklib.parse_ss_listeners(ss)
+        self.assertEqual(listeners["8096"], "process jellyfin")
+        self.assertEqual(listeners["6881"], "process qbittorrent-nox")
+        for name, project, ports in records:
+            if project == stacklib.STACK_PROJECT:
+                continue
+            for port in stacklib.parse_published_ports(ports):
+                listeners[port] = f"container {name}"
+        message = stacklib.describe_start_blockers(
+            settings,
+            use_vpn=False,
+            cloudflare=False,
+            containers=records,
+            listeners=listeners,
+        )
+        self.assertIn("jellyfin", message)
+        self.assertIn("media-stack", message)
+        self.assertIn("docker stop jellyfin qbittorrent", message)
+        self.assertIn("8080", message)
+        self.assertIn("container imgproxy", message)
+        self.assertIn("QBIT_PORT=", message)
+        self.assertIn("frees the ports", message)
+        self.assertNotIn("6881", message)
+        self.assertNotIn("8096  Jellyfin", message)
+
+    def test_a_host_program_on_jellyfins_port_is_named(self):
+        settings = stacklib.Settings(use_vpn="0")
+        message = stacklib.describe_start_blockers(
+            settings,
+            use_vpn=False,
+            cloudflare=False,
+            containers=[],
+            listeners={"8096": "process jellyfin", "6881": "process qbittorrent-nox"},
+        )
+        self.assertIn("8096", message)
+        self.assertIn("JELLYFIN_PORT=", message)
+        self.assertIn("6881", message)
+        self.assertIn("cannot be moved", message)
+
+    def test_a_free_machine_has_nothing_to_report(self):
+        settings = stacklib.Settings(use_vpn="0")
+        message = stacklib.describe_start_blockers(
+            settings,
+            use_vpn=False,
+            cloudflare=False,
+            containers=[],
+            listeners={},
+        )
+        self.assertEqual(message, "")
+
+    def test_the_same_port_cannot_be_used_twice(self):
+        settings = stacklib.Settings(use_vpn="0", jellyfin_port="8096", qbit_port="8096")
+        message = stacklib.describe_start_blockers(
+            settings,
+            use_vpn=False,
+            cloudflare=False,
+            containers=[],
+            listeners={},
+        )
+        self.assertIn("8096", message)
+        self.assertIn("JELLYFIN_PORT", message)
+        self.assertIn("QBIT_PORT", message)
 
     def test_classify_install_includes_the_vpn_when_it_is_in_use(self):
         with TemporaryDirectory() as tmp:
