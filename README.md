@@ -269,3 +269,11 @@ curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/scrip
 - Seerr was signed in with the Jellyfin admin, and movie requests use Physical/Web availability.
 
 The VPN, Cloudflare, port-forward, and Tailscale paths need your own accounts or router, so those were checked as instructions and unit tests, not against a live provider.
+
+## License
+
+The installer, the compose files, and this guide are [MIT licensed](LICENSE). Copyright 2026 Cosmin Mare.
+
+The setup follows [Bryce Hoehn's automated Jellyfin guide](https://github.com/bryce-hoehn/automated-jellyfin-guide) (mirror of [the Codeberg original](https://codeberg.org/bhoehn/automated-jellyfin-guide)). That guide is a separate work. This repository does not include it.
+
+Jellyfin, Seerr, Radarr, Sonarr, Prowlarr, qBittorrent, FlareSolverr, Gluetun, and the other programs keep their own licenses. The command only downloads their images. It does not relicense them.
