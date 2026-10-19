@@ -125,7 +125,7 @@ If the command stops early, read the message and run the command it prints. Comm
 
 - The VPN login is missing. Pass `OPENVPN_USER` and `OPENVPN_PASSWORD`, or rerun with `--no-vpn`.
 - Docker could not start. On Linux, run `sudo systemctl start docker` and rerun the curl command. On macOS or Windows, open Docker Desktop and rerun it.
-- A port is already taken. The message names the program on that port. qBittorrent uses 8080, which many other programs also use. Set `QBIT_PORT` to a free port, such as 8090, and rerun. Jellyfin, Seerr, and the shelves have the same kind of variable in `.env.example`. Port 6881 belongs to downloads. If another program has it, stop that program and rerun. That port cannot be moved.
+- A port is already taken. The command names the program on that port and asks whether to move this stack to a free port or abort. Press Enter to use the free port. Type 2 to stop and leave the ports unchanged. qBittorrent uses 8080, which many other programs also use. `--yes` does not ask: it prints a free port, such as `QBIT_PORT=8090`, and stops. Port 6881 belongs to downloads. If another program has it, stop that program and rerun. That port cannot be moved.
 - A container named `jellyfin` or `qbittorrent` is already running from another setup. The message names it. Stop and remove that container, then rerun. Folders that setup mounted are left where they are. Its settings, watch history, and download queue stay in the old config folder. This installer starts new ones. A container from somewhere else is not treated as this install.
 
 ## 2. Tell it where to search

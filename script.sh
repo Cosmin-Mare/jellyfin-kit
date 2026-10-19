@@ -46,9 +46,9 @@ one that pulls container images.
    A missing VPN login wants OPENVPN_USER and OPENVPN_PASSWORD,
    or --no-vpn. A missing Docker install wants Docker Desktop on a Mac
    or Windows machine, then the same ./install.sh again.
-   A taken port names the program. qBittorrent's page is 8080, which is
-   often already used: set QBIT_PORT to a free port and rerun. Port 6881
-   is the download port and cannot be moved. A container named jellyfin
+   A taken port names the program and asks whether to use a free port
+   or abort. qBittorrent's page is 8080, which is often already used.
+   --yes does not ask: it prints QBIT_PORT and stops. Port 6881 is the download port and cannot be moved. A container named jellyfin
    or qbittorrent from another setup has to be stopped and removed first.
    Its folders stay where they are.
 

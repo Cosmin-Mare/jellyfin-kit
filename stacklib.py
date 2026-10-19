@@ -3303,6 +3303,97 @@ def parse_ss_listeners(text: str) -> dict[str, str]:
     return owners
 
 
+PORT_ATTRS = {
+    "JELLYFIN_PORT": "jellyfin_port",
+    "SEERR_PORT": "seerr_port",
+    "RADARR_PORT": "radarr_port",
+    "SONARR_PORT": "sonarr_port",
+    "PROWLARR_PORT": "prowlarr_port",
+    "FLARESOLVERR_PORT": "flaresolverr_port",
+    "QBIT_PORT": "qbit_port",
+}
+
+
+def busy_host_ports(
+    settings: Settings,
+    *,
+    use_vpn: bool,
+    cloudflare: bool,
+    containers: Iterable[tuple[str, str, str]],
+    listeners: Mapping[str, str],
+) -> list[tuple[str, str, str, str]]:
+    """Ports this stack needs that something else is holding: (port, app, env var, holder)."""
+    wanted = set(required_container_names(use_vpn, cloudflare))
+    foreign_names: set[str] = set()
+    own_ports: set[str] = set()
+    for name, project, ports in containers:
+        if project == STACK_PROJECT:
+            own_ports.update(parse_published_ports(ports))
+        if name in wanted and project != STACK_PROJECT:
+            foreign_names.add(name.lower())
+    busy: list[tuple[str, str, str, str]] = []
+    for port, label, env in required_host_ports(settings):
+        if port in own_ports:
+            continue
+        holder = listeners.get(port, "")
+        if not holder:
+            continue
+        # A host-network container does not list its ports in `docker ps`.
+        # The process name still contains the container name. Stopping that
+        # container frees the port, so it is not a second problem.
+        if any(name in holder.lower() for name in foreign_names):
+            continue
+        busy.append((port, label, env, holder))
+    return busy
+
+
+def resolve_busy_ports(
+    settings: Settings,
+    busy: list[tuple[str, str, str, str]],
+    listeners: Mapping[str, str],
+    *,
+    assume_yes: bool,
+) -> bool:
+    """Offer a free port, or abort. True when a port was changed."""
+    movable = [item for item in busy if item[2]]
+    fixed = [item for item in busy if not item[2]]
+    if not movable or fixed or assume_yes or not can_prompt():
+        return False
+    changed = False
+    for port, label, env, holder in movable:
+        print()
+        print(f"Port {port} is already used ({holder}).")
+        print(f"{label} needs a different port.")
+        print()
+        while True:
+            taken = set(listeners) | {item for item, _name, _env in required_host_ports(settings)}
+            suggestion = _example_free_port(taken, avoid=port)
+            print(f"  1  Use {suggestion}")
+            print("  2  Abort")
+            print()
+            answer = prompt("Choice", "1").strip()
+            if answer.lower() in {"2", "abort", "n", "no", "q", "quit"}:
+                raise SetupError("Left the ports unchanged.")
+            if answer.lower() in {"1", "y", "yes", ""}:
+                chosen = suggestion
+            elif answer.isdigit():
+                chosen = answer
+            else:
+                print("Type 1 to use the free port, 2 to abort, or type a port number.")
+                continue
+            if not chosen.isdigit() or not 1 <= int(chosen) <= 65535:
+                print("Type a port from 1 to 65535, 1 to accept the suggestion, or 2 to abort.")
+                continue
+            if chosen in taken:
+                print(f"Port {chosen} is not free. Type another port, or 2 to abort.")
+                continue
+            setattr(settings, PORT_ATTRS[env], chosen)
+            print(f"{label} will use port {chosen}.")
+            changed = True
+            break
+    return changed
+
+
 def describe_start_blockers(
     settings: Settings,
     *,
@@ -3314,10 +3405,7 @@ def describe_start_blockers(
     """Explain name and port conflicts before Docker starts half the stack."""
     wanted = set(required_container_names(use_vpn, cloudflare))
     foreign: list[tuple[str, str]] = []
-    own_ports: set[str] = set()
-    for name, project, ports in containers:
-        if project == STACK_PROJECT:
-            own_ports.update(parse_published_ports(ports))
+    for name, project, _ports in containers:
         if name in wanted and project != STACK_PROJECT:
             where = f"project {project}" if project else "not started by this installer"
             foreign.append((name, where))
@@ -3357,20 +3445,13 @@ def describe_start_blockers(
     if duplicate_lines:
         paragraphs.append("\n".join(duplicate_lines))
 
-    foreign_names = {name.lower() for name, _where in foreign}
-    busy: list[tuple[str, str, str, str]] = []
-    for port, label, env in needed:
-        if port in own_ports:
-            continue
-        holder = listeners.get(port, "")
-        if not holder:
-            continue
-        # A host-network container does not list its ports in `docker ps`.
-        # The process name still contains the container name. Stopping that
-        # container frees the port, so it is not a second problem.
-        if any(name in holder.lower() for name in foreign_names):
-            continue
-        busy.append((port, label, env, holder))
+    busy = busy_host_ports(
+        settings,
+        use_vpn=use_vpn,
+        cloudflare=cloudflare,
+        containers=containers,
+        listeners=listeners,
+    )
     if busy:
         lines = ["These ports are already taken:"]
         seen_env: set[str] = set()
@@ -3415,11 +3496,13 @@ def _example_free_port(taken: set[str], avoid: str) -> str:
     return "18080"
 
 
-def collect_start_blockers(settings: Settings, use_vpn: bool, cloudflare: bool) -> str:
+def collect_start_blockers(
+    settings: Settings, use_vpn: bool, cloudflare: bool
+) -> tuple[str, list[tuple[str, str, str, str]], dict[str, str]]:
     try:
         command = docker_command()
     except SetupError:
-        return ""
+        return "", [], {}
     result = subprocess.run(
         command
         + [
@@ -3433,7 +3516,7 @@ def collect_start_blockers(settings: Settings, use_vpn: bool, cloudflare: bool) 
         text=True,
     )
     if result.returncode != 0:
-        return ""
+        return "", [], {}
     listeners: dict[str, str] = {}
     if shutil.which("ss"):
         probed = subprocess.run(["ss", "-H", "-lntup"], check=False, capture_output=True, text=True)
@@ -3443,12 +3526,23 @@ def collect_start_blockers(settings: Settings, use_vpn: bool, cloudflare: bool) 
             continue
         for port in parse_published_ports(ports):
             listeners[port] = f"container {name}"
-    return describe_start_blockers(
-        settings,
-        use_vpn=use_vpn,
-        cloudflare=cloudflare,
-        containers=parse_docker_ps(result.stdout),
-        listeners=listeners,
+    records = parse_docker_ps(result.stdout)
+    return (
+        describe_start_blockers(
+            settings,
+            use_vpn=use_vpn,
+            cloudflare=cloudflare,
+            containers=records,
+            listeners=listeners,
+        ),
+        busy_host_ports(
+            settings,
+            use_vpn=use_vpn,
+            cloudflare=cloudflare,
+            containers=records,
+            listeners=listeners,
+        ),
+        listeners,
     )
 
 
@@ -3554,8 +3648,15 @@ def install(assume_yes: bool, no_vpn: bool, configure_only: bool, remote: str | 
     gluetun_names = [key.removeprefix("GLUETUN_") for key in extras]
     use_tunnel = settings.remote_access == "cloudflare" and bool(settings.cloudflare_tunnel_token)
     if not configure_only:
-        blocked = collect_start_blockers(settings, settings.vpn_enabled, use_tunnel or local_tunnel)
-        if blocked:
+        while True:
+            blocked, busy, listeners = collect_start_blockers(
+                settings, settings.vpn_enabled, use_tunnel or local_tunnel
+            )
+            if not blocked:
+                break
+            if resolve_busy_ports(settings, busy, listeners, assume_yes=assume_yes):
+                write_env_file(ENV_PATH, settings, extras)
+                continue
             raise SetupError(blocked)
     prepare_directories(settings)
     (ROOT / "docker-compose.yml").write_text(

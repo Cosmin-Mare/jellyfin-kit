@@ -1148,6 +1148,29 @@ class StacklibTests(unittest.TestCase):
         self.assertIn("JELLYFIN_PORT", message)
         self.assertIn("QBIT_PORT", message)
 
+    def test_a_busy_port_can_move_or_abort(self):
+        settings = stacklib.Settings(use_vpn="0", qbit_port="8080")
+        busy = [("8080", "qBittorrent", "QBIT_PORT", "container imgproxy")]
+        listeners = {"8080": "container imgproxy"}
+        with unittest.mock.patch.object(stacklib, "can_prompt", return_value=True):
+            self.assertFalse(
+                stacklib.resolve_busy_ports(settings, busy, listeners, assume_yes=True)
+            )
+            self.assertEqual(settings.qbit_port, "8080")
+            with unittest.mock.patch.object(stacklib, "read_answer", return_value="2"):
+                with self.assertRaises(stacklib.SetupError) as raised:
+                    stacklib.resolve_busy_ports(settings, busy, listeners, assume_yes=False)
+            self.assertIn("unchanged", str(raised.exception))
+            self.assertEqual(settings.qbit_port, "8080")
+            with unittest.mock.patch.object(stacklib, "read_answer", return_value="1"):
+                moved = stacklib.resolve_busy_ports(settings, busy, listeners, assume_yes=False)
+            self.assertTrue(moved)
+            self.assertEqual(settings.qbit_port, "8090")
+            settings.qbit_port = "8080"
+            with unittest.mock.patch.object(stacklib, "read_answer", return_value="8123"):
+                moved = stacklib.resolve_busy_ports(settings, busy, listeners, assume_yes=False)
+            self.assertEqual(settings.qbit_port, "8123")
+
     def test_classify_install_includes_the_vpn_when_it_is_in_use(self):
         with TemporaryDirectory() as tmp:
             present, missing = stacklib.classify_install(
