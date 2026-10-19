@@ -1,4 +1,6 @@
 import base64
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -447,7 +449,10 @@ class StacklibTests(unittest.TestCase):
         self.assertNotIn("{{", vpn)
         self.assertIn("network_mode: service:gluetun", vpn)
         self.assertIn("FIREWALL_OUTBOUND_SUBNETS", vpn)
-        self.assertIn("ghcr.io/seerr-team/seerr:latest", vpn)
+        self.assertIn(
+            f"ghcr.io/seerr-team/seerr:${{IMAGE_TAG_SEERR:-{stacklib.IMAGE_TAGS['SEERR']}}}",
+            vpn,
+        )
         self.assertIn('user: "${PUID}:${PGID}"', vpn)
         self.assertIn("container_name: gluetun", vpn)
         self.assertNotIn("{extra_block}", vpn)
@@ -458,6 +463,45 @@ class StacklibTests(unittest.TestCase):
         self.assertNotIn("gluetun", direct)
         self.assertIn("${QBIT_PORT:-8080}:8080", direct)
         self.assertIn("${PROWLARR_PORT:-9696}:9696", direct)
+
+    def test_compose_images_are_pinned_and_overridable(self):
+        for text, names in (
+            (stacklib.render_compose(True), set(stacklib.IMAGE_REPOS)),
+            (stacklib.render_compose(False), set(stacklib.IMAGE_REPOS) - {"GLUETUN"}),
+        ):
+            self.assertNotIn("@IMAGE_", text)
+            self.assertNotIn(":latest", text)
+            for name in names:
+                line = (
+                    f"image: {stacklib.IMAGE_REPOS[name]}:"
+                    f"${{IMAGE_TAG_{name}:-{stacklib.IMAGE_TAGS[name]}}}"
+                )
+                self.assertIn(line, text)
+        for name, tag in stacklib.IMAGE_TAGS.items():
+            self.assertTrue(tag)
+            self.assertNotEqual(tag, "latest")
+            self.assertEqual(set(stacklib.IMAGE_TAGS), set(stacklib.IMAGE_REPOS))
+
+    def test_env_rewrite_keeps_chosen_image_versions(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".env"
+            path.write_text(
+                "ADMIN_USER=admin\nIMAGE_TAG_SONARR=4.0.99\nIMAGE_TAG_RADARR=\n"
+                "IMAGE_TAG_UNKNOWN=1.2.3\nGLUETUN_SERVER_COUNTRIES=Netherlands\n",
+                encoding="utf-8",
+            )
+            stacklib.write_env_file(
+                path,
+                stacklib.Settings.from_mapping({"ADMIN_USER": "admin"}),
+                {"GLUETUN_SERVER_COUNTRIES": "Netherlands"},
+            )
+            written = stacklib.load_env_file(path)
+            self.assertEqual(written["IMAGE_TAG_SONARR"], "4.0.99")
+            self.assertNotIn("IMAGE_TAG_RADARR", written)
+            self.assertNotIn("IMAGE_TAG_UNKNOWN", written)
+            self.assertEqual(written["GLUETUN_SERVER_COUNTRIES"], "Netherlands")
+            stacklib.write_env_file(path, stacklib.Settings.from_mapping({"ADMIN_USER": "admin"}))
+            self.assertEqual(stacklib.load_env_file(path)["IMAGE_TAG_SONARR"], "4.0.99")
 
     def test_qbittorrent_conf_seeds_account_and_vpn_bind(self):
         with TemporaryDirectory() as tmp:
@@ -846,6 +890,65 @@ class StacklibTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertIn("/mnt/cdn-storage/media/movies", text)
             self.assertIn("/mnt/cdn-storage/downloads/completed", text)
+
+    def test_private_files_are_owner_only_from_the_start(self):
+        with TemporaryDirectory() as tmp:
+            fresh = Path(tmp) / "fresh.txt"
+            stacklib.write_private_file(fresh, "one\ntwo\n")
+            self.assertEqual(fresh.read_text(encoding="utf-8"), "one\ntwo\n")
+            self.assertEqual(fresh.stat().st_mode & 0o777, 0o600)
+            old = Path(tmp) / "old.txt"
+            old.write_text("a much longer earlier text\n", encoding="utf-8")
+            os.chmod(old, 0o644)
+            stacklib.write_private_file(old, "short")
+            self.assertEqual(old.read_text(encoding="utf-8"), "short")
+            self.assertEqual(old.stat().st_mode & 0o777, 0o600)
+            env_path = Path(tmp) / ".env"
+            stacklib.write_env_file(env_path, stacklib.Settings.from_mapping({"ADMIN_USER": "admin"}))
+            self.assertEqual(env_path.stat().st_mode & 0o777, 0o600)
+
+    def test_credentials_file_matches_the_printed_text(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "credentials.txt"
+            settings = stacklib.Settings(admin_password="secret", use_vpn="0")
+            with unittest.mock.patch.object(stacklib, "CREDENTIALS_PATH", path):
+                stacklib.write_credentials(settings, {"sonarr": "abc"}, "A note.")
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                stacklib.credentials_text(settings, {"sonarr": "abc"}, "A note."),
+            )
+
+    def test_show_credentials_saves_only_when_asked(self):
+        settings = stacklib.Settings(admin_password="hunter2hunter2", use_vpn="0")
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "credentials.txt"
+            with unittest.mock.patch.object(stacklib, "CREDENTIALS_PATH", path):
+                saved = io.StringIO()
+                with contextlib.redirect_stdout(saved):
+                    stacklib.show_credentials(settings, {}, save=True)
+                self.assertIn("hunter2hunter2", path.read_text(encoding="utf-8"))
+                self.assertIn("Saved to", saved.getvalue())
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "credentials.txt"
+            with unittest.mock.patch.object(stacklib, "CREDENTIALS_PATH", path):
+                shown = io.StringIO()
+                with contextlib.redirect_stdout(shown):
+                    stacklib.show_credentials(settings, {}, save=False)
+                self.assertFalse(path.exists())
+                self.assertIn("hunter2hunter2", shown.getvalue())
+                self.assertIn("not saved", shown.getvalue())
+                self.assertNotIn("older", shown.getvalue())
+                path.write_text("earlier copy", encoding="utf-8")
+                again = io.StringIO()
+                with contextlib.redirect_stdout(again):
+                    stacklib.show_credentials(settings, {}, save=False)
+                self.assertEqual(path.read_text(encoding="utf-8"), "earlier copy")
+                self.assertIn("older", again.getvalue())
+
+    def test_no_credentials_file_flag(self):
+        parser = stacklib.build_parser()
+        self.assertFalse(parser.parse_args([]).no_credentials_file)
+        self.assertTrue(parser.parse_args(["--no-credentials-file"]).no_credentials_file)
 
     def test_cloudflare_error_tells_you_which_permission_to_add(self):
         message = stacklib.cloudflare_error_message(

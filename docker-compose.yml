@@ -2,7 +2,7 @@ name: jellyfin
 
 services:
   jellyfin:
-    image: ghcr.io/linuxserver/jellyfin
+    image: ghcr.io/linuxserver/jellyfin:${IMAGE_TAG_JELLYFIN:-version-12.2ubu2604}
     container_name: jellyfin
     environment:
       - PUID=${PUID}
@@ -16,7 +16,7 @@ services:
     restart: unless-stopped
 
   gluetun:
-    image: qmcgaw/gluetun
+    image: qmcgaw/gluetun:${IMAGE_TAG_GLUETUN:-v3.41.3}
     container_name: gluetun
     cap_add:
       - NET_ADMIN
@@ -45,7 +45,7 @@ services:
     restart: unless-stopped
 
   qbittorrent:
-    image: ghcr.io/linuxserver/qbittorrent
+    image: ghcr.io/linuxserver/qbittorrent:${IMAGE_TAG_QBITTORRENT:-5.2.4}
     container_name: qbittorrent
     environment:
       - PUID=${PUID}
@@ -62,7 +62,7 @@ services:
     restart: unless-stopped
 
   prowlarr:
-    image: lscr.io/linuxserver/prowlarr:latest
+    image: lscr.io/linuxserver/prowlarr:${IMAGE_TAG_PROWLARR:-2.6.5}
     container_name: prowlarr
     environment:
       - PUID=${PUID}
@@ -76,7 +76,7 @@ services:
     restart: unless-stopped
 
   flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
+    image: ghcr.io/flaresolverr/flaresolverr:${IMAGE_TAG_FLARESOLVERR:-v3.5.2}
     container_name: flaresolverr
     environment:
       - LOG_LEVEL=info
@@ -87,7 +87,7 @@ services:
     restart: unless-stopped
 
   sonarr:
-    image: ghcr.io/linuxserver/sonarr
+    image: ghcr.io/linuxserver/sonarr:${IMAGE_TAG_SONARR:-4.0.20}
     container_name: sonarr
     environment:
       - PUID=${PUID}
@@ -102,7 +102,7 @@ services:
     restart: unless-stopped
 
   radarr:
-    image: ghcr.io/linuxserver/radarr
+    image: ghcr.io/linuxserver/radarr:${IMAGE_TAG_RADARR:-6.4.4}
     container_name: radarr
     environment:
       - PUID=${PUID}
@@ -117,7 +117,7 @@ services:
     restart: unless-stopped
 
   seerr:
-    image: ghcr.io/seerr-team/seerr:latest
+    image: ghcr.io/seerr-team/seerr:${IMAGE_TAG_SEERR:-v3.5.0}
     container_name: seerr
     user: "${PUID}:${PGID}"
     environment:

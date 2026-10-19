@@ -32,8 +32,8 @@ one that pulls container images.
 
        curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/install.sh | bash -s -- --yes --no-vpn
 
-   The password is printed and saved in credentials.txt. The same login
-   is used for every app below.
+   The password is printed, and saved in credentials.txt unless you say
+   no. The same login is used for every app below.
 
    Jellyfin    http://127.0.0.1:8096   play the files
    Seerr       http://127.0.0.1:5055   request a title

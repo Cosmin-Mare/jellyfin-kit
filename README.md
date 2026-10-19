@@ -4,7 +4,7 @@
 
 This sets up a private streaming library on a computer you control. You type the name of a movie or a show, click Request, and the computer downloads it and files it. You then press play in a browser, or in a TV app, the way you would on a streaming service. The files stay on your machine.
 
-You do not sign up for a website. One command installs the programs that do each job, creates one login for all of them, and connects them. When it finishes, it prints that username and password and saves them in a file called `credentials.txt`.
+You do not sign up for a website. One command installs the programs that do each job, creates one login for all of them, and connects them. When it finishes, it prints that username and password. It asks whether to save them in a file called `credentials.txt`. See [The password](#the-password) if you would rather not keep that file.
 
 Here is the path, in the order you will use it:
 
@@ -115,7 +115,7 @@ The command cannot open the VPN account. These are accounts you create yourself.
 
 Privado's free plan is the one that allows torrent traffic without a bill. 10 GB is about one film. Proton's free plan is selected with `GLUETUN_FREE_ONLY=on`. Mullvad dropped OpenVPN in January 2026, so use the WireGuard command above. Privado uses the OpenVPN command. IVPN is the name the installer suggests when it asks.
 
-When it finishes, it prints the password and saves it in `credentials.txt`. Sign in with that password on every address in the table above. Start with Seerr at http://127.0.0.1:5055 if you want to request something, or Jellyfin at http://127.0.0.1:8096 if you only want to play what is already on disk.
+When it finishes, it prints the password and, unless you said no, saves it in `credentials.txt`. Sign in with that password on every address in the table above. Start with Seerr at http://127.0.0.1:5055 if you want to request something, or Jellyfin at http://127.0.0.1:8096 if you only want to play what is already on disk.
 
 Radarr is at http://127.0.0.1:7878, Sonarr at http://127.0.0.1:8989, Prowlarr at http://127.0.0.1:9696, and qBittorrent at http://127.0.0.1:8080.
 
@@ -269,6 +269,57 @@ docker compose -f docker-compose.novpn.yml down
 ```
 
 Paths, ports, timezone, and the admin login can be set in `.env` before you run the command. The comments in `.env.example` name each one. `.env` and `credentials.txt` stay on this machine.
+
+### The password
+
+One password works for every program. The installer prints it when it finishes, then asks whether to save it in `credentials.txt`. That file holds the password in plain text. Only your user can read it, and git ignores it. Press Enter to keep it, or answer no to have the login printed once and not saved. To skip the question, pass `--no-credentials-file`:
+
+```bash
+./install.sh --no-credentials-file
+```
+
+If you answer no, copy the login into a password manager right then. The password is also kept in `.env`, which is readable only by your user too, because running the installer again needs it there. A `credentials.txt` from an earlier run is left alone. Delete it yourself if you do not want that copy.
+
+### Versions
+
+Every program runs at a fixed version, not "the newest build". The installer talks to each program's own API, and a new major release can change what it expects, so a fixed version keeps a fresh install the same next month as it is today. The versions are listed in `IMAGE_TAGS` in `stacklib.py`, and they show up in `docker-compose.yml`.
+
+To run a different version of one program, add a line to `.env`, then run the install command again:
+
+```bash
+IMAGE_TAG_SONARR=4.0.21
+```
+
+The names are `IMAGE_TAG_JELLYFIN`, `IMAGE_TAG_QBITTORRENT`, `IMAGE_TAG_PROWLARR`, `IMAGE_TAG_SONARR`, `IMAGE_TAG_RADARR`, `IMAGE_TAG_SEERR`, `IMAGE_TAG_FLARESOLVERR`, and `IMAGE_TAG_GLUETUN`. Setting one to `latest` follows the newest build, which is not what this installer was checked against. The install keeps these lines when it rewrites `.env`. Remove a line to go back to the version this installer ships.
+
+To move to the versions a newer copy of this installer ships, run the install command again. It writes the compose file again and starts the stack, and Docker downloads any image whose version changed. Your configuration and library stay where they are. The optional Cloudflare Tunnel container is not pinned: it follows `latest`.
+
+## How this compares
+
+This is not the only way to build this, and it is not the simplest for every case.
+
+- **A hosted service, such as Stremio with a debrid account like TorBox.** Nothing runs on your computer, so there is nothing to keep up. You pay a subscription and depend on those services. Here, the library and the files stay on your machine, nothing is billed monthly, and what you already own plays offline on your network.
+- **Swizzin.** A modular installer where you pick the apps you want from a list. This project covers one fixed stack, runs it in Docker, and its job is to connect the pieces: one login everywhere, Prowlarr tied to Sonarr and Radarr, both tied to qBittorrent, and Seerr tied to Jellyfin. Read Swizzin's own documentation for what it installs and how.
+- **[Bryce Hoehn's automated Jellyfin guide](https://github.com/bryce-hoehn/automated-jellyfin-guide).** This setup follows it. The guide has you create each account by hand in a browser. Here the command does that.
+- **Putting it together yourself.** Often the right choice when you already run Jellyfin or a download client and want to keep it. See the limits below.
+
+## Limits
+
+- The installer expects to own the stack. If a container named `jellyfin` or `qbittorrent` is already running from another setup, it stops and asks you to remove it first. Using a Jellyfin or qBittorrent you already have is not supported yet.
+- Quality is capped at 1080p in Sonarr and Radarr. Prowlarr has no indexer until you add one.
+- The install was run from start to finish on Ubuntu (see below). Other distributions and platforms should work, since the stack is Docker, but they are not checked.
+- The movie and TV shelves, the downloader, and the indexers are never opened to the internet. Remote watching covers the player and the search page only.
+
+## Ideas, not promised
+
+These came up as suggestions. None of them exists yet, and the order is not a commitment.
+
+- Bazarr, for subtitles. It ties into Sonarr and Radarr the same way the rest does.
+- A Usenet downloader, such as SABnzbd, as an alternative or an addition to qBittorrent. It needs a Usenet provider and a Newznab indexer, which you bring yourself.
+- Using an existing Jellyfin or qBittorrent instead of installing new ones.
+- Optional extras behind a flag, so the default install stays small.
+
+Open an issue to say what you would use, or send a pull request.
 
 ## Read the path before installing
 
