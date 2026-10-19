@@ -421,6 +421,40 @@ class StacklibTests(unittest.TestCase):
         secret = ini[len('"@ByteArray(') : -2]
         self.assertTrue(stacklib.verify_qbittorrent_secret(secret, "correct horse"))
 
+    def test_quality_cap_can_allow_4k(self):
+        profile = stacklib.cap_profile(sample_profile(), 2160)
+        by_name = {}
+
+        def walk(items):
+            for item in items:
+                if item.get("items"):
+                    by_name[item["name"]] = item["allowed"]
+                    walk(item["items"])
+                else:
+                    by_name[item["quality"]["name"]] = item["allowed"]
+
+        walk(profile["items"])
+        self.assertTrue(by_name["Bluray-2160p"])
+        self.assertTrue(by_name["WEBDL-2160p"])
+        self.assertEqual(profile["cutoff"], 19)
+
+    def test_max_quality_defaults_to_1080_and_flag_allows_4k(self):
+        self._cleared_settings_env()
+        os.environ["ADMIN_PASSWORD"] = "correct horse"
+        self.addCleanup(lambda: os.environ.pop("ADMIN_PASSWORD", None))
+        with TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(stacklib, "ENV_PATH", Path(tmp) / ".env"):
+                settings, _ = stacklib.collect_settings(assume_yes=True, no_vpn=True)
+                self.assertEqual(settings.max_quality, "1080")
+                self.assertEqual(stacklib.max_resolution(settings), 1080)
+                settings, _ = stacklib.collect_settings(assume_yes=True, no_vpn=True, max_quality="2160")
+                self.assertEqual(stacklib.max_resolution(settings), 2160)
+
+    def test_max_quality_flag_is_parsed(self):
+        args = stacklib.build_parser().parse_args(["--max-quality", "2160"])
+        self.assertEqual(args.max_quality, "2160")
+        self.assertIsNone(stacklib.build_parser().parse_args([]).max_quality)
+
     def test_quality_cap_stops_at_1080p(self):
         profile = stacklib.cap_profile_at_1080(sample_profile())
         by_name = {}

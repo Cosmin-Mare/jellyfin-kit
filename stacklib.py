@@ -111,6 +111,7 @@ class Settings:
     cloudflare_tunnel_token: str = ""
     public_jellyfin_url: str = ""
     public_seerr_url: str = ""
+    max_quality: str = "1080"
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, str]) -> "Settings":
@@ -821,8 +822,8 @@ def patch_servarr_auth(config_xml: Path) -> None:
     tree.write(config_xml, encoding="utf-8", xml_declaration=True)
 
 
-def cap_profile_at_1080(profile: dict[str, Any]) -> dict[str, Any]:
-    """Allow qualities up to 1080p and upgrade until the best allowed 1080p."""
+def cap_profile(profile: dict[str, Any], max_resolution: int = 1080) -> dict[str, Any]:
+    """Allow qualities up to max_resolution and upgrade until the best allowed one."""
 
     def resolution(item: dict[str, Any]) -> int:
         quality = item.get("quality") or {}
@@ -841,7 +842,7 @@ def cap_profile_at_1080(profile: dict[str, Any]) -> dict[str, Any]:
                 continue
             name = quality_name(item)
             res = resolution(item)
-            if res > 1080 or "2160" in name:
+            if res > max_resolution or (max_resolution < 2160 and "2160" in name):
                 item["allowed"] = False
             elif res >= 720:
                 item["allowed"] = True
@@ -855,14 +856,14 @@ def cap_profile_at_1080(profile: dict[str, Any]) -> dict[str, Any]:
                 nested = cutoff(children)
                 child_res = max((resolution(child) for child in children), default=0)
                 rank = child_res + (50 if "bluray" in quality_name(item).lower() else 0)
-                if item.get("allowed") and nested is not None and rank >= best_rank and child_res <= 1080:
+                if item.get("allowed") and nested is not None and rank >= best_rank and child_res <= max_resolution:
                     best_id = item.get("id", nested)
                     best_rank = rank
                 continue
             if not item.get("allowed"):
                 continue
             res = resolution(item)
-            if res > 1080:
+            if res > max_resolution:
                 continue
             name = quality_name(item).lower()
             rank = res + (50 if "bluray" in name else 0)
@@ -879,6 +880,14 @@ def cap_profile_at_1080(profile: dict[str, Any]) -> dict[str, Any]:
     if chosen is not None:
         profile["cutoff"] = chosen
     return profile
+
+
+def cap_profile_at_1080(profile: dict[str, Any]) -> dict[str, Any]:
+    return cap_profile(profile, 1080)
+
+
+def max_resolution(settings: Settings) -> int:
+    return 2160 if settings.max_quality.strip() in {"2160", "4k", "4K"} else 1080
 
 
 def apply_field_values(fields: list[dict[str, Any]], overrides: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1305,7 +1314,7 @@ class StackConfigurator:
         if not isinstance(profiles, list) or not profiles:
             raise SetupError(f"{name} did not return quality profiles.")
         profile = next((item for item in profiles if item.get("name") == "Any"), profiles[0])
-        cap_profile_at_1080(profile)
+        cap_profile(profile, max_resolution(self.settings))
         client.request("PUT", f"/api/{version}/qualityprofile/{profile['id']}", json_body=profile)
         self.profile_ids[name] = int(profile["id"])
 
@@ -3108,7 +3117,12 @@ def require_cloudflare_credentials(settings: Settings) -> None:
         )
 
 
-def collect_settings(assume_yes: bool, no_vpn: bool, remote: str | None = None) -> tuple[Settings, dict[str, str]]:
+def collect_settings(
+    assume_yes: bool,
+    no_vpn: bool,
+    remote: str | None = None,
+    max_quality: str | None = None,
+) -> tuple[Settings, dict[str, str]]:
     existing = merged_env()
     settings = Settings.from_mapping(existing)
     if not settings.puid or settings.puid == "1000" and "PUID" not in existing:
@@ -3122,6 +3136,17 @@ def collect_settings(assume_yes: bool, no_vpn: bool, remote: str | None = None) 
     settings.media_dir = prompt("Media directory", settings.media_dir, assume_yes=assume_yes)
     settings.download_dir = prompt("Download directory", settings.download_dir, assume_yes=assume_yes)
     settings.tz = prompt("Timezone", settings.tz, assume_yes=assume_yes)
+    if max_quality:
+        settings.max_quality = max_quality
+    elif "MAX_QUALITY" not in existing:
+        allow_4k = confirm(
+            "Allow 4K (2160p) in Sonarr and Radarr? Files are 3 to 8 times bigger, and many TVs and phones need transcoding",
+            default=False,
+            assume_yes=assume_yes,
+        )
+        settings.max_quality = "2160" if allow_4k else "1080"
+    if settings.max_quality.strip() not in {"1080", "2160"}:
+        settings.max_quality = "1080"
 
     if no_vpn:
         settings.use_vpn = "0"
@@ -3708,8 +3733,11 @@ def install(
     configure_only: bool,
     remote: str | None = None,
     save_credentials: bool | None = None,
+    max_quality: str | None = None,
 ) -> None:
-    settings, extras = collect_settings(assume_yes=assume_yes, no_vpn=no_vpn, remote=remote)
+    settings, extras = collect_settings(
+        assume_yes=assume_yes, no_vpn=no_vpn, remote=remote, max_quality=max_quality
+    )
     repair = review_existing(settings, assume_yes=assume_yes)
     write_env_file(ENV_PATH, settings, extras)
     require_cloudflare_credentials(settings)
@@ -3853,6 +3881,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not save the login to credentials.txt. It is printed once instead.",
     )
+    parser.add_argument(
+        "--max-quality",
+        choices=["1080", "2160"],
+        help="Highest quality Sonarr and Radarr may grab. Default 1080. 2160 allows 4K.",
+    )
     parser.add_argument("--configure-only", action="store_true", help="Skip docker compose and only configure running apps.")
     parser.add_argument("--render-only", action="store_true", help="Write compose files and exit.")
     parser.add_argument(
@@ -3881,6 +3914,7 @@ def main(argv: list[str] | None = None) -> int:
             configure_only=args.configure_only,
             remote=args.remote,
             save_credentials=False if args.no_credentials_file else None,
+            max_quality=args.max_quality,
         )
     except SetupError as error:
         print(f"error: {error}", file=sys.stderr)

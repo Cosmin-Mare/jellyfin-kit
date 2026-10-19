@@ -270,6 +270,10 @@ docker compose -f docker-compose.novpn.yml down
 
 Paths, ports, timezone, and the admin login can be set in `.env` before you run the command. The comments in `.env.example` name each one. `.env` and `credentials.txt` stay on this machine.
 
+### 4K
+
+Sonarr and Radarr stop at 1080p by default. 4K files are 3 to 8 times bigger, and many TVs and phones need transcoding to play them. The installer asks whether to allow 4K, and the answer is no unless you say yes. To skip the question, pass `--max-quality 2160` (or `--max-quality 1080`). The choice is saved as `MAX_QUALITY` in `.env` and applied each run.
+
 ### The password
 
 One password works for every program. The installer prints it when it finishes, then asks whether to save it in `credentials.txt`. That file holds the password in plain text. Only your user can read it, and git ignores it. Press Enter to keep it, or answer no to have the login printed once and not saved. To skip the question, pass `--no-credentials-file`:
@@ -306,7 +310,7 @@ This is not the only way to build this, and it is not the simplest for every cas
 ## Limits
 
 - The installer expects to own the stack. If a container named `jellyfin` or `qbittorrent` is already running from another setup, it stops and asks you to remove it first. Using a Jellyfin or qBittorrent you already have is not supported yet.
-- Quality is capped at 1080p in Sonarr and Radarr. Prowlarr has no indexer until you add one.
+- Quality is capped at 1080p in Sonarr and Radarr unless you allow 4K (see "4K" below). Prowlarr has no indexer until you add one.
 - The install was run from start to finish on Ubuntu (see below). Other distributions and platforms should work, since the stack is Docker, but they are not checked.
 - The movie and TV shelves, the downloader, and the indexers are never opened to the internet. Remote watching covers the player and the search page only.
 
@@ -335,7 +339,7 @@ curl -fsSL https://raw.githubusercontent.com/Cosmin-Mare/jellyfin-kit/main/scrip
 
 - Jellyfin's startup wizard was done, the admin login worked, and Movies and TV pointed at `/media/movies` and `/media/tv`.
 - qBittorrent accepted the generated login and used `/downloads/completed` and `/downloads/incomplete`.
-- Sonarr and Radarr signed in, had `/tv` and `/movies` as root folders, and had qBittorrent as the download client. Qualities are capped at 1080p.
+- Sonarr and Radarr signed in, had `/tv` and `/movies` as root folders, and had qBittorrent as the download client. Qualities are capped at 1080p by default.
 - Prowlarr had Sonarr, Radarr, and the FlareSolverr proxy.
 - Seerr was signed in with the Jellyfin admin, and movie requests use Physical/Web availability.
 
